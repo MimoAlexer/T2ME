@@ -1,139 +1,278 @@
-# T2ME architecture and safety
+# T2ME 0.2 development architecture
 
-This document describes T2ME 0.1.0 as implemented for Forge 1.20.1. It is
-intended for server operators, reviewers, and contributors who need the
-threading and persistence model rather than a marketing summary.
+This document describes the experimental `0.2.0-dev.1` implementation for
+Forge 1.20.1. It is a code-review document, not a claim that the design is
+already faster or safe for production.
+
+T2ME 0.2 changes two different layers:
+
+1. a high-throughput pregeneration scheduler keeps `FULL` chunk futures in
+   flight; and
+2. a scoped stage engine redirects selected chunk-status generation calls to
+   a dedicated worker pool.
+
+The layers are related but not interchangeable. The scheduler decides which
+chunks enter the pipeline. The stage engine decides where selected generation
+stages for those chunks begin execution.
 
 ## Design goals
 
-T2ME is designed around five constraints:
+1. Beat Chunky on the same Forge 1.20.1 pregeneration workload after controlled
+   A/B validation.
+2. Remove avoidable ticket, distance-manager, callback, and persistence
+   overhead from the 0.1 scheduler.
+3. Expose more safe world-generation parallelism without moving lighting,
+   `FULL` conversion, or region-file ownership into T2ME.
+4. Confine the changed stage path to the active T2ME job and its dependencies.
+5. Back off quickly when MSPT or heap headroom indicates saturation.
+6. Keep pause, retry, ticket cleanup, restart recovery, and visible failure
+   semantics.
 
-1. Generate a bounded circle or square from the center outward.
-2. Keep several `FULL` chunk requests in flight without blocking the server
-   thread on each request.
-3. Let Minecraft and Forge perform terrain generation, lighting, and storage
-   through their normal task graph.
-4. Adapt admission to tick time, memory headroom, CPU availability, and player
-   presence.
-5. Preserve enough state to continue after a normal restart without skipping
-   requests that had not completed.
-
-It is intentionally not a replacement for `ChunkMap`, the chunk-status
-pipeline, the region-file layer, or an engine optimization mod.
+The release criterion is not "more threads." It is a repeatable throughput
+win with equivalent generated work and no unacceptable correctness or health
+regression. See [Benchmarking](BENCHMARKING.md).
 
 ## Components
 
 | Component | Responsibility |
 | --- | --- |
-| `T2ME` | Registers server configuration, commands, lifecycle events, and tick callbacks. |
-| `T2MECommands` | Defines permission-gated operator commands and validates their arguments. |
-| `PregenService` | Owns the active job, tickets, request pipeline, lifecycle, metrics, and persistence boundaries. |
-| `PregenJob` | Tracks state, counters, retries, pending and in-flight coordinates, rates, and snapshots. |
-| `SpiralChunkPlan` | Deterministically enumerates chunks center-out and filters them against the requested block-space shape. |
-| `AdaptiveLimiter` | Calculates the current request-admission limit. |
+| `T2ME` | Registers configuration, commands, player lifecycle events, server lifecycle events, and tick callbacks. |
+| `T2MECommands` | Defines permission-gated commands and sends styled multi-line responses. |
+| `PregenService` | Owns the job, ticket pipeline, completion queue, adaptive control loop, display, and persistence boundaries. |
+| `PregenJob` | Tracks state, counters, fixed-window rates, latency, retries, pending/in-flight coordinates, and snapshots. |
+| `SpiralChunkPlan` | Enumerates chunks center-out, filters the requested shape, and provides batched candidates. |
+| `AdaptiveLimiter` | Runs the adaptive request-window controller. |
+| `ThreadedWorldgenEngine` | Routes eligible chunk stages to the T2ME worker pool while a matching scope is active. |
+| `NeighborhoodLockManager` | Provides asynchronous multi-coordinate exclusion without blocking worker threads. |
+| `ChunkStatusMixin` | Redirects only the vanilla generation-task call through the stage engine for eligible work. |
+| `ServerChunkCacheAccessor` | Invokes the server-thread future and distance-manager methods used for batched admission. |
+| `PregenDisplay` | Owns the server boss bar and viewer reconciliation. |
+| `PregenComponents` / `PregenView` | Create a single presentation snapshot used by chat and the boss bar. |
 | `CompatibilityGuard` | Detects known competing pregenerators and invasive threading mods. |
-| `T2MEData` | Stores one job snapshot using overworld `SavedData`. |
+| `T2MEData` | Stores one job snapshot through overworld `SavedData`. |
 
-## Request flow
+## Scheduler data flow
 
 ```mermaid
 flowchart TD
-    A["End of server tick"] --> B["AdaptiveLimiter calculates admission"]
-    B --> C{"Capacity and work available?"}
-    C -- "No" --> A
-    C -- "Yes" --> D["Plan supplies the next chunk"]
-    D --> E["Server thread adds a unique region ticket"]
-    E --> F["Server thread marks request in flight"]
-    F --> G["Coordinator calls public getChunkFuture"]
-    G --> H["Minecraft/Forge worker graph reaches FULL"]
-    H --> I["Callback is queued on the server thread"]
-    I --> J["Server thread removes the ticket"]
-    J --> K{"Request succeeded?"}
-    K -- "Yes" --> L["Count completion and persist"]
-    K -- "No, retry remains" --> M["Requeue coordinate and persist"]
-    K -- "No retries remain" --> N["Retain coordinate and pause job"]
+    A["Server tick start"] --> B["Drain up to maxCompletionsPerTick events"]
+    B --> C["Remove completed T2ME tickets"]
+    C --> D["Apply success, retry, pause, or completion to the job"]
+    D --> E["One distance-manager update per touched dimension cache"]
+    E --> F["Normal server tick work"]
+    F --> G["Server tick end"]
+    G --> H["AIMD controller calculates admission window"]
+    H --> I{"Running, healthy, and capacity available?"}
+    I -- "No" --> N["Update display and tick timing"]
+    I -- "Yes" --> J["Select up to maxDispatchPerTick coordinates"]
+    J --> K["Add every region ticket and mark every request in flight"]
+    K --> L["Run one distance-manager update for the batch"]
+    L --> M["Obtain each FULL future through the main-thread path"]
+    M --> O["Callbacks publish immutable completion events"]
+    O --> A
+    N --> A
 ```
 
-### Why there is a coordinator thread
+### Why direct main-thread access is used
 
-On Forge 1.20.1, invoking the public chunk-future request through
-`ServerChunkCache` from its main thread can enter a managed blocking path.
-T2ME therefore uses one bounded daemon thread named
-`T2ME-Request-Coordinator` to enter that public API and obtain/compose its
+T2ME 0.1 entered the public `ServerChunkCache#getChunkFuture` path through a
+single coordinator thread. That introduced an off-thread handoff and
+managed-blocking path for every requested chunk.
+
+T2ME 0.2 is already executing admission at tick end on the server thread. It
+therefore uses Mixin invokers to:
+
+1. add all T2ME region tickets for a batch;
+2. call `runDistanceManagerUpdates` once so the corresponding holders exist;
+3. call `getChunkFutureMainThread(x, z, FULL, false)` for every item; and
+4. attach a callback that only publishes a completion event.
+
+`create=false` is intentional: the region ticket and distance-manager pass
+must create the holder before the future is requested. If that assumption is
+violated, the result is handled as a visible failed request.
+
+This path removes repeated distance-manager passes and the coordinator
+round-trip, but it relies on private Minecraft implementation details exposed
+through Mixins. That is one reason the branch is experimental and restricted
+to the exact supported Minecraft/Forge version.
+
+### Completion queue
+
+Chunk futures may finish on several Minecraft or T2ME workers. Their callbacks
+must not mutate job state or tickets. They append immutable `CompletionEvent`
+values to a `ConcurrentLinkedQueue`, which is used as a multi-producer,
+single-consumer queue in this design.
+
+At tick start, the server thread drains at most
+`maxCompletionsPerTick` events. It:
+
+- removes the matching region ticket;
+- rejects stale callbacks whose job UUID or issuance number no longer matches;
+- updates success, retry, failure, and latency counters;
+- performs one distance-manager update per touched chunk cache; and
+- persists only meaningful state transitions immediately.
+
+Periodic `SavedData` snapshots remain controlled by `saveIntervalTicks`.
+This avoids one server task and one persistence operation per completed
 future.
 
-This coordinator is not a terrain-generation executor. It:
+## Adaptive request window
 
-- does not generate or light chunks;
-- does not read or mutate a `ServerLevel` or `ChunkAccess`;
-- does not add or remove tickets;
-- does not update job state or `SavedData`; and
-- does not write region files.
+The controller uses additive-increase/multiplicative-decrease behavior. Its
+defaults are:
 
-All of those responsibilities remain with the server thread or the standard
-Minecraft/Forge task graph. The coordinator executor has one thread and a
-bounded queue of 32 submissions.
+```text
+minimum window:          32 futures
+initial window:          64 futures
+configured maximum:     384 futures
+control interval:        20 ticks
+target tick EWMA:        48 ms
+hard-stop tick EWMA:     65 ms
+minimum heap headroom:  512 MiB
+```
+
+The configured maximum is also capped from the JVM maximum heap:
+
+```text
+heap window = min(512, maxHeapGiB * 24)
+effective maximum = min(configured maximum, max(64, heap window))
+```
+
+The controller initializes at the configured initial window, clamped between
+the effective bounds. On control ticks:
+
+- healthy, at-least-75%-occupied pipelines add `max(4, processor count)` to
+  the window;
+- throughput improvements update the remembered best window;
+- a fall below 85% of the remembered best throughput can restore that best
+  window after significant overshoot;
+- exceeding target MSPT multiplies the window by `0.8`;
+- exceeding hard-stop MSPT multiplies the internal window by `0.5` and returns
+  zero admission;
+- insufficient heap headroom also halves the internal window and returns zero
+  admission; and
+- optional player protection halves admission when players are online.
+
+The tick EWMA uses alpha `0.08`. The decaying peak and scheduler reason are
+reported for diagnosis.
+
+The controller searches for a useful queue depth; it does not choose the
+number of world-generation workers. A larger future window can keep a worker
+graph busy, but beyond the hardware's saturation point it can reduce
+throughput through memory pressure, garbage collection, lock contention, or
+storage contention.
+
+## Stage-aware world-generation engine
+
+`ChunkStatusMixin` redirects only the `GenerationTask#doWork` invocation
+inside `ChunkStatus#generate`. Vanilla retains ownership of profiling, future
+composition, and status publication. The redirect asks
+`ThreadedWorldgenEngine` whether a stage is eligible and immediately invokes
+the original task/executor when it is not.
+
+The engine is active only when:
+
+- `threadedWorldgen.enabled=true`;
+- a T2ME job is running, or its already admitted work is still in flight;
+- the chunk belongs to the job's dimension;
+- the chunk center is inside the circle or square plus a 12-chunk dependency
+  margin; and
+- the current `ChunkStatus` is enabled for threading.
+
+### Default stage policy
+
+| Stage | Default | Lock radius | Notes |
+| --- | --- | ---: | --- |
+| `STRUCTURE_STARTS` | Native | `0` when opted in | Structure mods can retain shared mutable state. |
+| `STRUCTURE_REFERENCES` | Native | `0` when opted in | Controlled by `threadedWorldgen.structures`. |
+| `BIOMES` | Threaded | `0` | Runs through the T2ME worker pool. |
+| `NOISE` | Threaded | `0` | Primary terrain-fill candidate. |
+| `SURFACE` | Threaded | `0` | Runs through the T2ME worker pool. |
+| `CARVERS` | Threaded | `0` | Runs through the T2ME worker pool. |
+| `FEATURES` | Native | `1` when opted in | Highest-risk switch for modded generators. |
+| `SPAWN` | Threaded | `0` | Runs through the T2ME worker pool. |
+| Lighting | Native | Not applicable | Never redirected by T2ME. |
+| `FULL` conversion | Native | Not applicable | Never redirected by T2ME. |
+
+A radius-zero lock excludes another T2ME-managed stage for the same chunk
+coordinate. A radius-one lock reserves the 3-by-3 chunk neighborhood.
+
+### Worker pool
+
+With `threadedWorldgen.threads=0`, the worker count is:
+
+```text
+clamp(available processors - 1, 2, 64)
+```
+
+An explicit value is clamped to `1-64`. Workers are daemon threads named
+`T2ME-Worldgen-N`, run one priority below normal, and are prestarted.
+
+The executor has a fixed worker count, but its current
+`LinkedBlockingQueue` is not size-bounded. Overall demand is indirectly
+limited by the adaptive in-flight window. Queue depth is exposed in
+`/t2me metrics`; a future hard queue bound remains a candidate if benchmarks
+show excessive queued stages.
+
+## Asynchronous neighborhood locks
+
+The lock manager maintains a tail future for each packed chunk coordinate.
+Acquiring several coordinates:
+
+1. installs one release future as the new tail for every requested key while
+   holding a short monitor;
+2. deduplicates and waits for all prior tails without parking a worker;
+3. produces one idempotent token; and
+4. removes only tails that still point to that token when it closes.
+
+Because the whole key set is reserved in one monitor section, two overlapping
+neighborhoods cannot deadlock through different acquisition orders. The token
+is closed on normal completion, stage failure, and executor rejection.
+
+This lock coordinates only work routed through T2ME. It cannot serialize
+unrelated mutable state inside an arbitrary third-party generator, which is
+why structures and features remain opt-in.
 
 ## Thread ownership
 
 | Operation | Owner |
 | --- | --- |
-| Command handling and plan creation | Server thread |
-| Admission decision | Server thread, at tick end |
+| Commands, plan creation, and job transitions | Server thread |
+| Adaptive admission decision | Server thread at tick end |
 | Add/remove T2ME region tickets | Server thread |
-| Poll the plan and update job state | Server thread |
-| Call `getChunkFuture` and compose its returned future | T2ME request coordinator |
-| Terrain generation, status transitions, and lighting | Minecraft/Forge task graph |
-| Interpret completion and update counters | Server thread |
+| Distance-manager updates for T2ME batches | Server thread |
+| Obtain `FULL` futures through the main-thread chunk-cache method | Server thread |
+| Publish immutable completion events | Any future-completion thread |
+| Drain completion events and update counters | Server thread |
+| Eligible stage entry | Fixed T2ME worldgen worker pool |
+| Eligible stage task and its supplied executor | T2ME worker pool, with inline execution for nested work already on a T2ME worker |
+| Other composed continuations | Executor selected by Minecraft, Forge, or the installed generator |
+| Lighting and `FULL` conversion | Native Minecraft/Forge path |
+| Region-file I/O | Native Minecraft/Forge path |
 | Snapshot job state | Server thread through Forge `SavedData` |
+| Boss-bar updates and viewers | Server thread |
 
-The future completion callback captures a ticket identity and schedules its
-handler through `MinecraftServer#execute`. The handler ignores completion
-against a different job UUID. Tickets additionally include a unique issuance
-UUID so a cancelled or retried request cannot collide with a later request for
-the same coordinate.
+T2ME does not assert that an entire stage future remains on one T2ME thread.
+It invokes the stage action on its worker; the returned future may compose
+continuations on executors chosen by Minecraft, Forge, or the generator.
 
 ## Planning model
 
 `SpiralChunkPlan` enumerates a deterministic square spiral centered on the
-chunk containing the requested block coordinate. A cursor counts inspected
-candidates. This makes the traversal resumable with a single `long`.
+chunk containing the requested block coordinate. A `long` cursor counts
+inspected candidates, making traversal restartable. Batch polling avoids
+repeated per-item setup.
 
-- `square` accepts any chunk whose block bounds overlap the requested square.
-- `circle` accepts any chunk whose block bounds intersect the requested
+- `square` accepts chunks whose block bounds overlap the requested square.
+- `circle` accepts chunks whose block bounds intersect the requested
   block-space circle.
 
-Consequently, boundary chunks are included even when only part of the chunk
-lies inside the requested shape. This is deliberate: it avoids gaps at the
-edge.
+The optimized target counter is linear in the chunk radius for circles and
+constant-time for squares. Boundary chunks are included when any part
+intersects the requested region, preventing edge gaps.
 
-The plan calculates its accepted target count when the job is created. Command
-input is limited to a radius of 16–20,000 blocks, and the entire region must
-remain inside `±29,999,984` block coordinates.
-
-## Adaptive admission
-
-Every server tick, T2ME records elapsed tick time and updates an exponentially
-weighted moving average with an alpha of `0.08`. The base request limit is:
-
-```text
-min(configured maxInFlight, clamp(available processors × 2, 2, 32))
-```
-
-Admission is then adjusted in this order:
-
-1. Stop when max-heap headroom is below `minHeapHeadroomMiB`.
-2. After the initial tick samples, stop when tick EWMA reaches
-   `hardStopTickMillis`.
-3. Halve the limit when tick EWMA reaches `targetTickMillis`.
-4. Halve the resulting limit again when players are online and
-   `reduceWhenPlayersOnline` is enabled.
-
-At most `maxDispatchPerTick` new requests are issued in one tick, and never
-more than the remaining effective in-flight capacity.
-
-This is backpressure, not a performance guarantee. A modded generator can
-still create long ticks after work has already been admitted.
+Command input is limited to a radius of `16-20,000` blocks, and the complete
+region must remain within Minecraft's safe coordinate range.
 
 ## Job and failure lifecycle
 
@@ -147,95 +286,118 @@ stateDiagram-v2
     PAUSED --> RUNNING: operator resume
     PAUSED --> RUNNING: delayed clean-restart auto-resume
     PAUSED --> CANCELLED: operator cancel
-    RUNNING --> FAILED: target dimension unloads
+    RUNNING --> PAUSED: target dimension unloads
 ```
 
-A request failure increments the failure counter and requeues the coordinate
-until `maxRetries` is exceeded. At that point, T2ME puts the coordinate back
-at the front of the retry queue and pauses. An operator can investigate and
-resume without losing that coordinate.
+A failed request is requeued until `job.maxRetries` is exceeded. The failing
+coordinate is retained at the front of the retry queue when the job pauses.
 
-If the oldest in-flight request reaches `stallTimeoutSeconds`, T2ME pauses
-admission and records the chunk in the job message. It does not attempt unsafe
-future cancellation or force a chunk-state transition.
+If the oldest in-flight request reaches `stallTimeoutSeconds`, T2ME:
 
-Pausing stops new admission. Already-issued futures may finish, and their
-server-thread callbacks can still advance progress. Cancelling releases all
-currently tracked T2ME tickets and clears the active job's queues.
+1. removes all tracked T2ME tickets;
+2. runs one distance-manager update;
+3. requeues every in-flight coordinate; and
+4. pauses with a visible coordinate and age.
+
+Pausing stops new admission but does not cancel already issued futures.
+Cancelling releases tracked tickets and rejects late completion events through
+job/issuance identity checks.
+
+If the target dimension becomes unavailable, T2ME requeues its tracked
+in-flight coordinates, deactivates the scoped stage engine, and pauses until
+an operator reloads the dimension and resumes the job.
 
 ## Persistence and restart recovery
 
-T2ME stores a snapshot in overworld `SavedData` under the name `t2me_jobs`.
-The snapshot contains:
+The job snapshot is stored in overworld `SavedData` as `t2me_jobs`. It
+contains:
 
 - job UUID and state;
 - dimension, center, radius, and shape;
-- traversal cursor and completion/failure counts;
+- traversal cursor and completion/failure counters;
 - creation time and current message; and
-- pending coordinates, including requests that were in flight when a normal
-  server stop began.
+- pending coordinates, including active requests requeued during normal stop;
+  and
+- per-coordinate retry counts, so a restart does not reset a failing chunk's
+  retry budget.
 
-During a normal stop, T2ME releases its region tickets, requeues all in-flight
-coordinates, preserves a `RUNNING` state, and marks the snapshot dirty. On the
-next server start, a recovered `RUNNING` job is first changed to `PAUSED`. If
-`autoResume` is enabled and the compatibility guard is clear, it resumes after
-200 server ticks (nominally 10 seconds).
+On normal server stop, T2ME releases its tickets, requeues active coordinates,
+preserves the running snapshot, stops the worker pool, and clears transient
+completion events. On the next start, a recovered `RUNNING` job first becomes
+`PAUSED`; with `job.autoResume=true`, it resumes after 200 ticks only if the
+compatibility guard is clear.
 
-A job that was manually paused or paused by stall/failure handling remains
-paused across restart. It does not auto-resume.
+This is operational recovery, not crash-proof transactional storage. A hard
+process or machine failure can lose progress since the last world save.
 
-Persistence reduces duplicate or skipped work after a clean restart; it is not
-a substitute for backups. Abrupt process termination can lose state since the
-last world save, and storage or third-party failures remain outside T2ME's
-control.
+## Display model
+
+`PregenView` is an immutable snapshot. Both commands and the boss bar consume
+it, preventing independently formatted values from disagreeing.
+
+The boss bar refreshes every 10 ticks by default and reconciles viewers every
+100 ticks. All players see it by default; the config can restrict it to users
+with the T2ME permission level. Completed, cancelled, and failed results stay
+visible for 200 ticks.
+
+Chat status is split into:
+
+- progress and percentage;
+- dimension, center, shape, and radius;
+- five-second and 60-second rates plus ETA;
+- active, retrying, and failed work;
+- worker, stage-queue, lock, and adaptive-window state; and
+- throttle reason, MSPT, latency, and job identity.
 
 ## Compatibility policy
 
-With `allowCompetingPregenerators=false`, T2ME refuses `start` and `resume`
-when these known IDs are loaded:
+With `job.allowCompetingPregenerators=false`, `start` and `resume` are blocked
+when T2ME detects:
 
-- Pregenerators: `chunky`, `c2me`, `c2me_forge`,
-  `chunk_pregenerator`
-- Threading mods: `dimthread`, `dimthreads`, `mcmt`
+- `chunky`
+- `c2me`
+- `c2me_forge`
+- `chunk_pregenerator`
+- `dimthread` / `dimthreads`
+- `mcmt`
 
-The guard is intentionally conservative. It avoids two independent systems
-owning chunk tickets/admission for the same workload and avoids combining T2ME
-with mods that substantially alter thread ownership.
+Canary and ModernFix are reported but do not block startup. This policy cannot
+prove compatibility with an unknown mod; it only prevents known double
+ownership.
 
-Canary and ModernFix are detected and reported but do not block T2ME.
-T2ME deliberately leaves Lithium-style engine patches to Canary.
+## Required invariants
 
-The override exists for expert pack maintainers whose conflicting mod is
-installed but operationally inactive. It is not a promise that simultaneous
-pregeneration is safe.
+Changes to the dev engine must preserve these invariants:
 
-## Safety invariants
+1. Job state, `SavedData`, and T2ME ticket mutation stay on the server thread.
+2. A completion is accepted only for the active job and matching issuance.
+3. Every admitted request is completed, requeued, or visibly retained; it is
+   never silently dropped.
+4. Every tracked ticket is removed on completion, cancellation, stall, or
+   normal shutdown when its dimension remains available.
+5. T2ME does not implement custom region-file I/O.
+6. Lighting and `FULL` conversion remain native.
+7. Stage threading remains scoped to the active job area and configured
+   statuses.
+8. Structures and `FEATURES` stay off by default until the target modpack
+   passes semantic parity and stress tests.
+9. Request admission and completion draining remain bounded per tick.
+10. No performance claim is published before the benchmark gate passes.
 
-Changes should preserve all of these invariants:
+## Known limitations and open risks
 
-1. Never directly mutate a world, chunk, ticket, or job from T2ME's
-   coordinator thread.
-2. Never perform custom region-file I/O.
-3. Every issued request receives a unique ticket. Request completion removes
-   that ticket, and cancellation or shutdown releases tracked tickets whenever
-   the target dimension remains available.
-4. Completion is accepted only for the active job and matching issuance.
-5. A failed coordinate must be completed, requeued, or visibly retained on a
-   paused job—never silently dropped.
-6. Persist before claiming restart recoverability.
-7. Keep admission bounded independently of operator configuration.
-
-## Known limitations
-
+- This branch overwrites `ChunkStatus#generate`, a compatibility-sensitive
+  method targeted by performance and world-generation mods.
+- The stage executor queue is not explicitly size-bounded.
+- Radius-zero locks do not protect cross-chunk mutable generator state.
+- The active-scope margin is fixed at 12 chunks and may not cover every custom
+  generator's nonstandard dependency behavior.
 - One persisted job is supported at a time.
 - Only loaded dimensions can be targeted.
-- Shape planning and target counting happen synchronously when `start` is
-  executed.
-- There is no chunk trimming, deletion, selection import/export, or
-  world-border integration.
-- T2ME does not benchmark, tune, or replace third-party terrain generators.
-- T2ME does not patch general server simulation or client rendering.
-- It cannot make an already-issued world-generation task preemptible.
+- T2ME has no trim, delete, selection import/export, or world-border tools.
+- A larger request window can make performance worse on memory-, disk-, or
+  lock-bound servers.
+- No mod can guarantee world integrity in every third-party mod combination.
 
-See [Comparison](COMPARISON.md) for how this scope differs from Chunky,
-Lithium, and Canary.
+See [Comparison](COMPARISON.md) for project scope and
+[Benchmarking](BENCHMARKING.md) for the required evidence.

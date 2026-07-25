@@ -2,8 +2,6 @@ package dev.t2me;
 
 import org.junit.jupiter.api.Test;
 
-import java.util.UUID;
-
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class PregenJobTest {
@@ -17,14 +15,14 @@ class PregenJobTest {
                 PregenShape.CIRCLE
         );
         long packed = job.pollNext();
-        UUID activeTicket = UUID.randomUUID();
+        long activeTicket = 11L;
         job.markInFlight(packed, 1L, activeTicket);
 
         assertEquals(
                 PregenJob.Completion.IGNORED,
                 job.complete(
                         packed,
-                        UUID.randomUUID(),
+                        12L,
                         true,
                         "",
                         2,
@@ -52,7 +50,7 @@ class PregenJobTest {
                 PregenShape.CIRCLE
         );
         long packed = job.pollNext();
-        UUID firstTicket = UUID.randomUUID();
+        long firstTicket = 21L;
         job.markInFlight(packed, 1L, firstTicket);
 
         assertEquals(
@@ -61,7 +59,7 @@ class PregenJobTest {
         );
         assertEquals(packed, job.pollNext());
 
-        UUID secondTicket = UUID.randomUUID();
+        long secondTicket = 22L;
         job.markInFlight(packed, 3L, secondTicket);
         assertEquals(
                 PregenJob.Completion.PAUSED,
@@ -84,8 +82,8 @@ class PregenJobTest {
         );
         long first = job.pollNext();
         long second = job.pollNext();
-        job.markInFlight(first, 1L, UUID.randomUUID());
-        job.markInFlight(second, 1L, UUID.randomUUID());
+        job.markInFlight(first, 1L, 31L);
+        job.markInFlight(second, 1L, 32L);
 
         job.requeueAllInFlight();
 
@@ -93,5 +91,72 @@ class PregenJobTest {
         assertEquals(2, job.retryQueueSize());
         assertEquals(first, job.pollNext());
         assertEquals(second, job.pollNext());
+    }
+
+    @Test
+    void snapshotPreservesRetryBudget() {
+        PregenJob job = new PregenJob(
+                "minecraft:overworld",
+                0,
+                0,
+                16,
+                PregenShape.CIRCLE
+        );
+        long packed = job.pollNext();
+        job.markInFlight(packed, 1L, 41L);
+        assertEquals(
+                PregenJob.Completion.RETRY,
+                job.complete(packed, 41L, false, "first", 1, 2L)
+        );
+
+        PregenJob restored = PregenJob.restore(job.snapshot());
+        assertEquals(packed, restored.pollNext());
+        restored.markInFlight(packed, 3L, 42L);
+
+        assertEquals(
+                PregenJob.Completion.PAUSED,
+                restored.complete(packed, 42L, false, "second", 1, 4L)
+        );
+        assertEquals(JobState.PAUSED, restored.state());
+    }
+
+    @Test
+    void shortRunRateUsesElapsedTimeAndResetsOnResume() {
+        PregenJob job = new PregenJob(
+                "minecraft:overworld",
+                0,
+                0,
+                32,
+                PregenShape.SQUARE
+        );
+        long started = job.runStartedNanos();
+        for (long ticket = 51L; ticket <= 52L; ticket++) {
+            long packed = job.pollNext();
+            job.markInFlight(packed, started, ticket);
+            assertEquals(
+                    PregenJob.Completion.SUCCESS,
+                    job.complete(
+                            packed,
+                            ticket,
+                            true,
+                            "",
+                            2,
+                            started + 2_000_000_000L
+                    )
+            );
+        }
+
+        assertEquals(
+                1.0D,
+                job.completionsPerSecond(60L, started + 2_000_000_000L),
+                0.000_001D
+        );
+
+        job.pause("test");
+        job.resume();
+        assertEquals(
+                0.0D,
+                job.completionsPerSecond(60L, job.runStartedNanos())
+        );
     }
 }

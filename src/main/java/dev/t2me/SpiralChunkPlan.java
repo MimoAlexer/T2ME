@@ -1,6 +1,7 @@
 package dev.t2me;
 
 import java.util.NoSuchElementException;
+import java.util.Arrays;
 
 /**
  * Allocation-light deterministic chunk traversal. Candidate chunks are visited
@@ -20,10 +21,17 @@ public final class SpiralChunkPlan {
     private final int centerChunkZ;
     private final int radiusBlocks;
     private final PregenShape shape;
+    private final int minChunkX;
+    private final int maxChunkX;
+    private final int minChunkZ;
+    private final int maxChunkZ;
     private final int ringRadius;
     private final long candidateCount;
     private final long targetCount;
     private long cursor;
+    private boolean nextPrepared;
+    private long preparedPacked;
+    private long preparedCursor;
 
     public SpiralChunkPlan(
             int centerBlockX,
@@ -61,10 +69,10 @@ public final class SpiralChunkPlan {
         this.radiusBlocks = radiusBlocks;
         this.shape = shape;
 
-        int minChunkX = Math.toIntExact(Math.floorDiv(minimumBlockX, CHUNK_SIZE));
-        int maxChunkX = Math.toIntExact(Math.floorDiv(maximumBlockX, CHUNK_SIZE));
-        int minChunkZ = Math.toIntExact(Math.floorDiv(minimumBlockZ, CHUNK_SIZE));
-        int maxChunkZ = Math.toIntExact(Math.floorDiv(maximumBlockZ, CHUNK_SIZE));
+        this.minChunkX = Math.toIntExact(Math.floorDiv(minimumBlockX, CHUNK_SIZE));
+        this.maxChunkX = Math.toIntExact(Math.floorDiv(maximumBlockX, CHUNK_SIZE));
+        this.minChunkZ = Math.toIntExact(Math.floorDiv(minimumBlockZ, CHUNK_SIZE));
+        this.maxChunkZ = Math.toIntExact(Math.floorDiv(maximumBlockZ, CHUNK_SIZE));
         this.ringRadius = Math.max(
                 Math.max(Math.abs(minChunkX - centerChunkX), Math.abs(maxChunkX - centerChunkX)),
                 Math.max(Math.abs(minChunkZ - centerChunkZ), Math.abs(maxChunkZ - centerChunkZ))
@@ -76,10 +84,16 @@ public final class SpiralChunkPlan {
     }
 
     public boolean hasNext() {
+        if (nextPrepared) {
+            return true;
+        }
         long probe = cursor;
         while (probe < candidateCount) {
             ChunkCoordinate coordinate = candidateAt(probe++);
             if (accepts(coordinate.x(), coordinate.z())) {
+                preparedPacked = pack(coordinate.x(), coordinate.z());
+                preparedCursor = probe;
+                nextPrepared = true;
                 return true;
             }
         }
@@ -87,13 +101,24 @@ public final class SpiralChunkPlan {
     }
 
     public long nextPacked() {
-        while (cursor < candidateCount) {
-            ChunkCoordinate coordinate = candidateAt(cursor++);
-            if (accepts(coordinate.x(), coordinate.z())) {
-                return pack(coordinate.x(), coordinate.z());
-            }
+        if (!hasNext()) {
+            throw new NoSuchElementException("chunk plan exhausted");
         }
-        throw new NoSuchElementException("chunk plan exhausted");
+        cursor = preparedCursor;
+        nextPrepared = false;
+        return preparedPacked;
+    }
+
+    public long[] nextBatch(int maximum) {
+        if (maximum < 0) {
+            throw new IllegalArgumentException("maximum must be non-negative");
+        }
+        long[] batch = new long[maximum];
+        int count = 0;
+        while (count < maximum && hasNext()) {
+            batch[count++] = nextPacked();
+        }
+        return count == batch.length ? batch : Arrays.copyOf(batch, count);
     }
 
     public long cursor() {
@@ -107,6 +132,7 @@ public final class SpiralChunkPlan {
             );
         }
         this.cursor = cursor;
+        this.nextPrepared = false;
     }
 
     public long targetCount() {
@@ -185,11 +211,40 @@ public final class SpiralChunkPlan {
     }
 
     private long countAccepted() {
+        if (shape == PregenShape.SQUARE) {
+            long width = (long) maxChunkX - minChunkX + 1L;
+            long height = (long) maxChunkZ - minChunkZ + 1L;
+            return Math.multiplyExact(width, height);
+        }
+
         long count = 0L;
-        for (long index = 0L; index < candidateCount; index++) {
-            ChunkCoordinate coordinate = candidateAt(index);
-            if (accepts(coordinate.x(), coordinate.z())) {
-                count++;
+        long radiusSquared = (long) radiusBlocks * radiusBlocks;
+        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+            long minimumX = (long) chunkX * CHUNK_SIZE;
+            long maximumX = minimumX + CHUNK_SIZE - 1L;
+            long nearestX = clamp(centerBlockX, minimumX, maximumX);
+            long deltaX = nearestX - centerBlockX;
+            long remainingSquared = radiusSquared - deltaX * deltaX;
+            if (remainingSquared < 0L) {
+                continue;
+            }
+            long maximumDeltaZ = (long) Math.floor(Math.sqrt(remainingSquared));
+            int rowMinimum = Math.max(
+                    minChunkZ,
+                    Math.toIntExact(Math.floorDiv(
+                            (long) centerBlockZ - maximumDeltaZ,
+                            CHUNK_SIZE
+                    ))
+            );
+            int rowMaximum = Math.min(
+                    maxChunkZ,
+                    Math.toIntExact(Math.floorDiv(
+                            (long) centerBlockZ + maximumDeltaZ,
+                            CHUNK_SIZE
+                    ))
+            );
+            if (rowMaximum >= rowMinimum) {
+                count += (long) rowMaximum - rowMinimum + 1L;
             }
         }
         return count;

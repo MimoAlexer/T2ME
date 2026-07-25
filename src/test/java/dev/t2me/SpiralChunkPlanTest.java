@@ -50,6 +50,64 @@ class SpiralChunkPlanTest {
     }
 
     @Test
+    void optimizedTargetCountMatchesBruteForceAcrossChunkBoundaries() {
+        int[] centers = {-33, -17, -16, -15, -1, 0, 1, 15, 16, 17, 33};
+        int[] radii = {0, 1, 15, 16, 17, 31, 32, 33, 127};
+
+        for (PregenShape shape : PregenShape.values()) {
+            for (int centerX : centers) {
+                for (int centerZ : centers) {
+                    for (int radius : radii) {
+                        SpiralChunkPlan plan = new SpiralChunkPlan(
+                                centerX,
+                                centerZ,
+                                radius,
+                                shape
+                        );
+                        assertEquals(
+                                bruteForceTarget(centerX, centerZ, radius, shape),
+                                plan.targetCount(),
+                                () -> "count mismatch for "
+                                        + shape
+                                        + " center="
+                                        + centerX
+                                        + ","
+                                        + centerZ
+                                        + " radius="
+                                        + radius
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void batchesCoverPlanExactlyOnceAndHandleBoundaries() {
+        SpiralChunkPlan plan = new SpiralChunkPlan(
+                7,
+                -11,
+                127,
+                PregenShape.CIRCLE
+        );
+        Set<Long> chunks = new HashSet<>();
+
+        assertEquals(0, plan.nextBatch(0).length);
+        while (plan.hasNext()) {
+            long[] batch = plan.nextBatch(7);
+            assertTrue(batch.length > 0);
+            assertTrue(batch.length <= 7);
+            for (long packed : batch) {
+                assertTrue(chunks.add(packed), "duplicate chunk in batches");
+            }
+        }
+
+        assertEquals(plan.targetCount(), chunks.size());
+        assertEquals(0, plan.nextBatch(7).length);
+        assertThrows(IllegalArgumentException.class, () -> plan.nextBatch(-1));
+    }
+
+    @Test
     void cursorResumesExactSequence() {
         SpiralChunkPlan first = new SpiralChunkPlan(23, -41, 256, PregenShape.CIRCLE);
         for (int index = 0; index < 200; index++) {
@@ -128,5 +186,47 @@ class SpiralChunkPlanTest {
             assertTrue(chunks.add(plan.nextPacked()), "duplicate chunk");
         }
         return chunks;
+    }
+
+    private static long bruteForceTarget(
+            int centerBlockX,
+            int centerBlockZ,
+            int radiusBlocks,
+            PregenShape shape
+    ) {
+        int minimumChunkX = Math.floorDiv(centerBlockX - radiusBlocks, 16);
+        int maximumChunkX = Math.floorDiv(centerBlockX + radiusBlocks, 16);
+        int minimumChunkZ = Math.floorDiv(centerBlockZ - radiusBlocks, 16);
+        int maximumChunkZ = Math.floorDiv(centerBlockZ + radiusBlocks, 16);
+        long radiusSquared = (long) radiusBlocks * radiusBlocks;
+        long count = 0L;
+
+        for (int chunkX = minimumChunkX; chunkX <= maximumChunkX; chunkX++) {
+            for (int chunkZ = minimumChunkZ; chunkZ <= maximumChunkZ; chunkZ++) {
+                long minimumX = (long) chunkX * 16L;
+                long maximumX = minimumX + 15L;
+                long minimumZ = (long) chunkZ * 16L;
+                long maximumZ = minimumZ + 15L;
+                if (shape == PregenShape.SQUARE) {
+                    count++;
+                    continue;
+                }
+
+                long nearestX = Math.max(
+                        minimumX,
+                        Math.min(centerBlockX, maximumX)
+                );
+                long nearestZ = Math.max(
+                        minimumZ,
+                        Math.min(centerBlockZ, maximumZ)
+                );
+                long deltaX = nearestX - centerBlockX;
+                long deltaZ = nearestZ - centerBlockZ;
+                if (deltaX * deltaX + deltaZ * deltaZ <= radiusSquared) {
+                    count++;
+                }
+            }
+        }
+        return count;
     }
 }

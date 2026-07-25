@@ -1,8 +1,22 @@
+buildscript {
+    repositories {
+        maven {
+            name = 'SpongePowered'
+            url = 'https://repo.spongepowered.org/repository/maven-public/'
+        }
+    }
+    dependencies {
+        classpath 'org.spongepowered:mixingradle:0.7-SNAPSHOT'
+    }
+}
+
 plugins {
     id 'eclipse'
     id 'idea'
     id 'net.minecraftforge.gradle' version '[6.0,6.2)'
 }
+
+apply plugin: 'org.spongepowered.mixin'
 
 version = mod_version
 group = mod_group_id
@@ -19,6 +33,7 @@ java {
 minecraft {
     mappings channel: mapping_channel, version: mapping_version
     copyIdeResources = true
+    accessTransformer = file('src/main/resources/META-INF/accesstransformer.cfg')
 
     runs {
         configureEach {
@@ -62,8 +77,14 @@ sourceSets.main.resources {
 
 dependencies {
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+    annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
     testImplementation platform('org.junit:junit-bom:5.10.2')
     testImplementation 'org.junit.jupiter:junit-jupiter'
+}
+
+mixin {
+    add sourceSets.main, 't2me.refmap.json'
+    config 't2me.mixins.json'
 }
 
 def resourceProperties = [
@@ -98,7 +119,8 @@ tasks.named('jar', Jar).configure {
                 'Specification-Version': '1',
                 'Implementation-Title': mod_name,
                 'Implementation-Version': project.version,
-                'Implementation-Vendor': mod_authors
+                'Implementation-Vendor': mod_authors,
+                'MixinConfigs': 't2me.mixins.json'
         )
     }
     finalizedBy 'reobfJar'

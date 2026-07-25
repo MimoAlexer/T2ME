@@ -11,6 +11,8 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.level.Level;
 
+import java.util.List;
+
 public final class T2MECommands {
     private static final int MIN_RADIUS_BLOCKS = 16;
     /*
@@ -28,20 +30,24 @@ public final class T2MECommands {
                 Commands.literal("t2me")
                         .requires(source -> source.hasPermission(T2MEConfig.PERMISSION_LEVEL.get()))
                         .then(Commands.literal("status")
-                                .executes(context -> sendText(
+                                .executes(context -> sendComponents(
                                         context.getSource(),
-                                        PregenService.INSTANCE.statusLine()
+                                        PregenComponents.status(
+                                                PregenService.INSTANCE.progressView()
+                                        )
                                 )))
                         .then(Commands.literal("metrics")
-                                .executes(context -> sendText(
+                                .executes(context -> sendComponents(
                                         context.getSource(),
-                                        PregenService.INSTANCE.metricsLine()
+                                        PregenComponents.metrics(
+                                                PregenService.INSTANCE.progressView()
+                                        )
                                 )))
                         .then(Commands.literal("config")
                                 .then(Commands.literal("show")
-                                        .executes(context -> sendText(
+                                        .executes(context -> sendComponents(
                                                 context.getSource(),
-                                                PregenService.INSTANCE.configLine()
+                                                PregenComponents.config()
                                         ))))
                         .then(Commands.literal("pregen")
                                 .then(spawnStartCommand())
@@ -62,9 +68,11 @@ public final class T2MECommands {
                                                 PregenService.INSTANCE.cancel()
                                         )))
                                 .then(Commands.literal("status")
-                                        .executes(context -> sendText(
+                                        .executes(context -> sendComponents(
                                                 context.getSource(),
-                                                PregenService.INSTANCE.statusLine()
+                                                PregenComponents.status(
+                                                        PregenService.INSTANCE.progressView()
+                                                )
                                         ))))
         );
     }
@@ -158,15 +166,22 @@ public final class T2MECommands {
             PregenService.OperationResult result
     ) {
         if (result.successful()) {
-            source.sendSuccess(() -> Component.literal(result.message()), true);
+            source.sendSuccess(
+                    () -> PregenComponents.operation(true, result.message()),
+                    true
+            );
             return 1;
         }
-        source.sendFailure(Component.literal(result.message()));
+        source.sendFailure(PregenComponents.operation(false, result.message()));
         return 0;
     }
 
-    private static int sendText(CommandSourceStack source, String text) {
-        source.sendSuccess(() -> Component.literal(text), false);
+    private static int sendComponents(
+            CommandSourceStack source,
+            List<Component> components
+    ) {
+        components.forEach(component ->
+                source.sendSuccess(() -> component, false));
         return 1;
     }
 }
