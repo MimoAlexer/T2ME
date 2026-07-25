@@ -1,0 +1,14 @@
+{
+  "required": true,
+  "minVersion": "0.8.5",
+  "package": "dev.t2me.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "t2me.refmap.json",
+  "mixins": [
+    "ChunkStatusMixin",
+    "ServerChunkCacheAccessor"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

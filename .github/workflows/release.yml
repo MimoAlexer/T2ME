@@ -71,6 +71,9 @@ jobs:
             exit 1
           fi
           jar tf "${jars[0]}" | grep -qx 'META-INF/mods.toml'
+          jar tf "${jars[0]}" | grep -qx 'META-INF/accesstransformer.cfg'
+          jar tf "${jars[0]}" | grep -qx 't2me.mixins.json'
+          jar tf "${jars[0]}" | grep -qx 't2me.refmap.json'
           jar tf "${jars[0]}" | grep -qx 'dev/t2me/T2ME.class'
           cp "${jars[0]}" dist/
           (

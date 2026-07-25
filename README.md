@@ -2,44 +2,95 @@
   <img src="docs/assets/t2me-logo.svg" alt="T2ME logo" width="220">
 </p>
 
-<h1 align="center">T2ME — Threaded Task Management Engine</h1>
+<h1 align="center">T2ME - Threaded Task Management Engine</h1>
 
-[![Build](https://github.com/MimoAlexer/T2ME/actions/workflows/ci.yml/badge.svg)](https://github.com/MimoAlexer/T2ME/actions/workflows/ci.yml)
+[![Build](https://github.com/MimoAlexer/T2ME/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/MimoAlexer/T2ME/actions/workflows/ci.yml?query=branch%3Adev)
 [![Minecraft](https://img.shields.io/badge/Minecraft-1.20.1-62b47a)](https://www.minecraft.net/)
 [![Forge](https://img.shields.io/badge/Forge-47.4.21-f16436)](https://files.minecraftforge.net/net/minecraftforge/forge/index_1.20.1.html)
 [![Java](https://img.shields.io/badge/Java-17-007396)](https://adoptium.net/temurin/releases/?version=17)
+[![Status](https://img.shields.io/badge/status-experimental%20dev-f0ad4e)](docs/BENCHMARKING.md)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-T2ME is a clean-room, server-side chunk pregenerator for Minecraft Forge
-1.20.1. It keeps a bounded pipeline of `FULL` chunk requests moving through
-Minecraft's existing task system, saves its progress, and automatically
-reduces admission when server health degrades.
+T2ME is an experimental, server-side chunk engine and pregenerator for
+Minecraft Forge 1.20.1. Version `0.2.0-dev.1` combines:
 
-The goal is useful throughput **without trading away world safety or server
-responsiveness**.
+- a high-throughput, batched `FULL`-chunk request pipeline;
+- an adaptive request window that searches for peak throughput;
+- a stage-aware worker pool for selected world-generation stages;
+- non-blocking coordinate locks for stages that need exclusion;
+- persistent, resumable circle and square jobs; and
+- readable chat output plus a live progress boss bar.
 
-> [!IMPORTANT]
-> T2ME is not a Forge port of C2ME or Lithium. It does not replace Minecraft's
-> terrain generator, patch game logic, or write region files from custom
-> threads. See [Architecture](docs/ARCHITECTURE.md) for the exact threading
-> boundary.
+The development objective is explicit: **complete the same pregeneration
+workload faster than Chunky on the target Forge modpack**. That is a target,
+not a measured result. T2ME will not claim a speed win until it beats Chunky
+by at least 10% median throughput under the controlled protocol in
+[Benchmarking](docs/BENCHMARKING.md), while also passing world-integrity and
+server-health checks.
 
-## Highlights
+> [!CAUTION]
+> This is the experimental `dev` branch. It changes Minecraft's chunk-status
+> scheduling path through Mixins and has not passed the release benchmark
+> gate. Build and test it only on disposable world copies. Do not install this
+> branch on a production server.
 
-- Center-out pregeneration in `circle` or `square` regions.
-- Spawn-centered jobs or explicit dimension and block coordinates.
-- A bounded pipeline of vanilla/Forge `FULL` chunk futures.
-- Adaptive admission using tick-time EWMA, heap headroom, processor count, and
-  online-player load.
-- Persistent cursor, progress, failures, and pending coordinates.
-- Safe clean-restart recovery with an optional 10-second auto-resume delay.
-- Pause, resume, cancel, status, metrics, CPS, and ETA commands.
-- Per-request region tickets with cleanup on success, failure, cancellation,
-  and normal shutdown.
-- Stalled-request detection and bounded retries without silently skipping the
-  affected coordinate.
-- A compatibility guard for known pregenerators and invasive threading mods.
-- Server-only installation; unmodified clients can connect.
+## What changed in 0.2 dev
+
+### Batched adaptive scheduler
+
+T2ME admits up to 64 new chunk requests in one tick by default. It adds the
+batch's region tickets first, runs one distance-manager update, then obtains
+the corresponding `FULL` futures directly on the server thread. Future
+callbacks publish small immutable completion events to a multi-producer,
+single-consumer queue; the server thread drains that queue in a bounded batch
+at the start of the next tick.
+
+The request window starts at 64, searches upward toward a default maximum of
+384, and uses additive-increase/multiplicative-decrease control. It backs off
+under MSPT or heap pressure and remembers a previously productive window.
+The window is a number of pipelined chunk futures, **not** a number of threads.
+
+### Scoped stage-aware world generation
+
+While a T2ME job is running, generation work inside that job's region (plus a
+12-chunk dependency margin) can use a dedicated fixed-size worker pool. The
+default threaded stages are:
+
+- `BIOMES`
+- `NOISE`
+- `SURFACE`
+- `CARVERS`
+- `SPAWN`
+
+Lighting and `FULL` conversion stay on the native Forge path. Structure
+threading and `FEATURES` threading are independent, opt-in development
+switches because modded generators often retain mutable state in those
+stages. `FEATURES`, when enabled, uses a radius-one neighborhood lock.
+
+This design is informed by public ideas in C2ME and Moonrise, but it is an
+independent Forge 1.20.1 implementation. It does not embed, shade, translate,
+or redistribute their code. See [Third-party notices](THIRD_PARTY_NOTICES.md).
+
+### Readable in-game progress
+
+`/t2me status`, `/t2me metrics`, and `/t2me config show` now use styled,
+multi-line output with separate progress, region, speed, work, engine, and
+scheduler sections.
+
+The boss bar is enabled for all players by default and shows percentage,
+completed/target chunks, current chunks per second, ETA, and active requests.
+Its colors communicate state:
+
+| Color | Meaning |
+| --- | --- |
+| Blue | Running |
+| Yellow | Paused or admission throttled |
+| Green | Completed |
+| White | Cancelled |
+| Red | Failed |
+
+A terminal result remains visible for 10 seconds. Operators can restrict the
+bar to permissioned players or disable it in the server config.
 
 ## Requirements
 
@@ -49,17 +100,21 @@ responsiveness**.
 | Forge | 47.4.21 |
 | Java | 17 |
 | Side | Dedicated or integrated server |
+| Current status | Experimental development build |
 
-T2ME has no required third-party mod dependency.
+T2ME has no required third-party mod dependency. Do not run T2ME and another
+pregenerator over the same world at the same time.
 
-## Installation
+## Development installation
 
-1. Back up the world and test the backup before pregenerating a large region.
-2. Stop the server.
-3. Download the T2ME JAR from
-   [GitHub Releases](https://github.com/MimoAlexer/T2ME/releases).
-4. Place it in the server's `mods` directory.
-5. Remove or disable other active pregenerators, then start the server.
+1. Make and verify an offline backup.
+2. Clone a separate copy of the world for testing.
+3. Check out the `dev` branch and build with Java 17.
+4. Stop the test server.
+5. Place the reobfuscated JAR from `build/libs/` in the test server's `mods`
+   directory.
+6. Remove or disable other active pregenerators for the T2ME run.
+7. Start the test server and inspect `/t2me config show` before starting work.
 
 Forge creates the configuration at:
 
@@ -67,8 +122,7 @@ Forge creates the configuration at:
 <world>/serverconfig/t2me-server.toml
 ```
 
-T2ME is server-side only. Players do not need the JAR in their client mod
-folder.
+T2ME is server-side only. Players do not need its JAR.
 
 ## Quick start
 
@@ -79,137 +133,133 @@ shared spawn:
 /t2me pregen start 10000 circle
 ```
 
-Watch progress and scheduler health:
+Monitor the job:
 
 ```mcfunction
 /t2me status
 /t2me metrics
 ```
 
-Pause safely at any time:
+Pause and resume:
 
 ```mcfunction
 /t2me pregen pause
-```
-
-Then continue the same job:
-
-```mcfunction
 /t2me pregen resume
 ```
 
-Only one T2ME job can be active or paused at a time. Starting a new job is
-allowed after the previous one reaches `completed`, `cancelled`, or `failed`.
+Only one T2ME job can be active or paused at a time.
 
 ## Commands
 
-All commands require permission level `4` by default.
+Commands require permission level `4` by default.
 
 | Command | Description |
 | --- | --- |
-| `/t2me pregen start <radiusBlocks> [circle\|square]` | Start at the overworld's current shared spawn. The default shape is `circle`. |
+| `/t2me pregen start <radiusBlocks> [circle\|square]` | Start at the overworld's current shared spawn. |
 | `/t2me pregen startat <dimension> <centerX> <centerZ> <radiusBlocks> [circle\|square]` | Start at explicit block coordinates in a loaded dimension. |
-| `/t2me pregen pause` | Stop admitting new requests while preserving the job. Existing requests may finish. |
+| `/t2me pregen pause` | Stop admitting new work while preserving the job. |
 | `/t2me pregen resume` | Resume a paused job if the compatibility guard permits it. |
-| `/t2me pregen cancel` | Release T2ME tickets and permanently cancel the current job. |
-| `/t2me pregen status` | Show the same detailed job status as `/t2me status`. |
-| `/t2me status` | Show state, target, progress, in-flight work, retries, CPS, ETA, throttle reason, and last message. |
-| `/t2me metrics` | Add tick EWMA, decaying tick peak, admission limit, heap headroom, and player count to job status. |
-| `/t2me config show` | Show the most important live configuration values. |
+| `/t2me pregen cancel` | Release T2ME tickets and cancel the current job. |
+| `/t2me pregen status` | Show the same detailed view as `/t2me status`. |
+| `/t2me status` | Show progress, region, speed, ETA, active work, engine state, and scheduler state. |
+| `/t2me metrics` | Add latency, lock, worker, MSPT, and queue details. |
+| `/t2me config show` | Show the active development performance profile. |
 
-`radiusBlocks` must be from `16` through `20,000`. The center plus radius must
-remain within Minecraft's safe coordinate range. Dimension identifiers use
-resource-location syntax, for example:
+`radiusBlocks` must be from `16` through `20,000`, and the whole region must
+remain inside Minecraft's safe coordinate range. For example:
 
 ```mcfunction
 /t2me pregen startat minecraft:the_nether 0 0 5000 square
 ```
 
-## Configuration
+## Development defaults
 
-The defaults are intentionally conservative. Measure MSPT, heap, and player
-experience before increasing concurrency.
+These settings favor offline throughput. They are not universal tuning advice.
+When every old scheduler value still exactly matches the 0.1 defaults, T2ME
+migrates that untouched legacy profile to the values below. If any legacy
+performance value was customized, it preserves the whole profile for the
+operator to review manually.
 
 | Key | Default | Range | Effect |
 | --- | ---: | ---: | --- |
-| `scheduler.maxInFlight` | `8` | `1–32` | Maximum simultaneous `FULL` requests before adaptive caps. |
-| `scheduler.maxDispatchPerTick` | `4` | `1–16` | Maximum new requests admitted at the end of one tick. |
-| `scheduler.targetTickMillis` | `45` | `20–100` | Halve admission when tick EWMA reaches this value. |
-| `scheduler.hardStopTickMillis` | `55` | `30–200` | Stop new admission while tick EWMA is at or above this value. |
-| `scheduler.minHeapHeadroomMiB` | `1024` | `256–8192` | Stop new admission below this max-heap headroom. |
-| `scheduler.stallTimeoutSeconds` | `120` | `30–3600` | Pause the job when the oldest request exceeds this age. |
-| `scheduler.reduceWhenPlayersOnline` | `true` | boolean | Halve admission while one or more players are online. |
-| `job.maxRetries` | `2` | `0–10` | Retry count per failed coordinate before pausing the job. |
-| `job.saveIntervalTicks` | `100` | `20–1200` | How often to mark a running snapshot for persistence. |
-| `job.progressLogIntervalSeconds` | `60` | `0–3600` | Periodic status logging; `0` disables it. |
-| `job.autoResume` | `true` | boolean | Resume a cleanly interrupted running job 10 seconds after startup. |
-| `job.allowCompetingPregenerators` | `false` | boolean | Override the compatibility guard. Use only when the other mod is inactive. |
-| `permissionLevel` | `4` | `0–4` | Required permission level for `/t2me`. |
-
-The effective in-flight limit is also capped at twice the JVM's available
-processors, with a minimum processor cap of two and an absolute cap of 32.
+| `scheduler.minInFlight` | `32` | `1-512` | Minimum adaptive request window. |
+| `scheduler.initialInFlight` | `64` | `1-1024` | Window used when the controller starts. |
+| `scheduler.maxInFlight` | `384` | `1-2048` | Configured upper request-window bound. A heap-derived cap can lower it. |
+| `scheduler.maxDispatchPerTick` | `64` | `1-512` | Maximum ticket/future admissions in one batch. |
+| `scheduler.maxCompletionsPerTick` | `1024` | `16-8192` | Maximum queued completion events applied per tick. |
+| `scheduler.controlIntervalTicks` | `20` | `5-200` | Adaptive-window update interval. |
+| `scheduler.targetTickMillis` | `48` | `20-100` | Begin multiplicative backoff above this tick EWMA. |
+| `scheduler.hardStopTickMillis` | `65` | `30-200` | Stop admission above this tick EWMA. |
+| `scheduler.minHeapHeadroomMiB` | `512` | `256-8192` | Stop admission below this max-heap headroom. |
+| `scheduler.stallTimeoutSeconds` | `120` | `30-3600` | Requeue active work and pause when the oldest request reaches this age. |
+| `scheduler.reduceWhenPlayersOnline` | `false` | boolean | Optionally halve admission when players are online. |
+| `threadedWorldgen.enabled` | `true` | boolean | Use the scoped stage-aware worker pool. |
+| `threadedWorldgen.threads` | `0` | `0-64` | Worker count; `0` selects available processors minus one, with bounds. |
+| `threadedWorldgen.structures` | `false` | boolean | Thread structure stages. Experimental and opt-in. |
+| `threadedWorldgen.features` | `false` | boolean | Thread `FEATURES` under radius-one locks. Highest-risk option. |
+| `job.maxRetries` | `2` | `0-10` | Retries per failed coordinate before pausing. |
+| `job.saveIntervalTicks` | `100` | `20-1200` | Periodic persisted job snapshot interval. |
+| `job.progressLogIntervalSeconds` | `60` | `0-3600` | Periodic progress log interval; `0` disables it. |
+| `job.autoResume` | `true` | boolean | Resume a cleanly interrupted running job after 200 ticks. |
+| `job.allowCompetingPregenerators` | `false` | boolean | Override the compatibility guard. |
+| `display.showBossBar` | `true` | boolean | Show the live progress boss bar. |
+| `display.bossBarAllPlayers` | `true` | boolean | Show it to all players instead of permissioned operators only. |
+| `display.bossBarUpdateTicks` | `10` | `5-200` | Boss-bar refresh interval. |
+| `permissionLevel` | `4` | `0-4` | Required permission level for `/t2me`. |
 
 ## Safety and compatibility
 
-T2ME makes the following guarantees within its own code:
+The dev engine deliberately limits its changed scheduling scope:
 
-- Chunk tickets, job state, configuration decisions, and completion handling
-  are performed on the server thread.
-- Its single request-coordinator thread only enters Forge's public
-  `getChunkFuture` API and composes the returned future. It does not read or
-  mutate chunks.
-- Actual terrain generation remains inside Minecraft/Forge's normal worker
-  graph.
-- Each request uses a job- and issuance-specific ticket identity, preventing a
-  late callback from completing a newer job's request.
-- A failed coordinate is retried or retained when the job pauses; it is not
-  silently counted as complete.
+- stage redirection is active only while a T2ME job is running and only in
+  that dimension and region plus its dependency margin;
+- T2ME never implements custom region-file writes;
+- lighting and `FULL` conversion remain native;
+- completion events mutate tickets and job state only on the server thread;
+- ticket identity includes the job and issuance, so late callbacks cannot
+  complete a newer request; and
+- failures are retried or visibly retained when the job pauses.
+
+These controls reduce risk; they do not prove compatibility with every
+world-generation mod. Structure and feature threading remain disabled until
+the target pack passes parity testing.
 
 T2ME blocks `start` and `resume` by default when it detects Chunky, C2ME,
 C2ME Forge, Chunk Pregenerator, Dimensional Threading, or MCMT. Canary and
-ModernFix are detected for reporting but are not blocked.
+ModernFix are reported but do not block startup.
 
-Canary is complementary on Forge 1.20.1: Canary can provide Lithium-style
-engine optimizations while T2ME owns pregeneration admission. Do not run two
-pregenerators over the same region at the same time.
+Read [Architecture](docs/ARCHITECTURE.md) for the exact thread and lock
+ownership model.
 
-For design details and the exact lifecycle, read
-[Architecture and safety](docs/ARCHITECTURE.md).
+## Is T2ME faster than Chunky?
 
-## T2ME, Chunky, Lithium, and Canary
+Not proven yet.
 
-These projects do different jobs. T2ME and Chunky are pregenerators;
-Lithium and Canary optimize game-engine logic. There is no honest universal
-"faster" winner without a controlled benchmark of the same seed, modpack,
-hardware, JVM, and server-health target.
+The 0.2 dev architecture removes several avoidable scheduler bottlenecks and
+can expose substantially more world-generation parallelism than the 0.1
+pipeline. Its default request window is also larger than the 50-future default
+visible in the cited Chunky
+[`GenerationTask` snapshot](https://github.com/pop4959/Chunky/blob/ab45b8b3a4ada40f69fbdb3af63d2a7004ce82a1/common/src/main/java/org/popcraft/chunky/GenerationTask.java#L25).
+Those facts make a win plausible, but queue depth is not throughput and a
+larger window can become slower through contention, garbage collection, or
+storage saturation.
 
-See the [feature-by-feature comparison](docs/COMPARISON.md) for the practical
-differences and guidance on choosing a setup.
+The only accepted answer is a repeatable A/B result. T2ME must achieve at
+least a 10% median throughput win over Chunky across at least three paired
+runs, with equal work, no generation errors, acceptable MSPT, and semantic
+world parity. See [Benchmarking](docs/BENCHMARKING.md).
 
-## Limitations
-
-- Forge 1.20.1 only.
-- One T2ME job at a time.
-- `circle` and `square` shapes only.
-- No trim, delete, world-border import, or selection-management commands.
-- No low-level terrain-generation, lighting, entity, AI, redstone, or physics
-  optimization patches.
-- Previously generated chunks are still requested at `FULL`; they normally
-  complete quickly but count toward progress.
-- Planning counts the region synchronously when a job starts. The
-  20,000-block radius cap limits this work, but very large plans can still
-  pause the command thread briefly.
-- Recovery depends on normal Forge world saving. Keep external world backups;
-  no mod can protect data from every crash, disk, hardware, or third-party
-  failure.
+For a one-to-one scope comparison with Chunky, Lithium, C2ME, Noisium, and
+Moonrise, see [Comparison](docs/COMPARISON.md).
 
 ## Build and test
 
-Clone the repository and build with a Java 17 JDK:
+Use a Java 17 JDK:
 
 ```powershell
 git clone https://github.com/MimoAlexer/T2ME.git
 cd T2ME
+git switch dev
 .\gradlew.bat clean test build
 ```
 
@@ -218,29 +268,30 @@ Linux and macOS:
 ```bash
 git clone https://github.com/MimoAlexer/T2ME.git
 cd T2ME
+git switch dev
 ./gradlew clean test build
 ```
 
-The reobfuscated production JAR is written to `build/libs/`.
-
-The unit suite covers deterministic spiral traversal, shape boundaries,
-cursor restoration, coordinate limits, stale ticket identities, retry
-exhaustion, and restart requeue ordering.
+The production JAR is written to `build/libs/`.
 
 ## Project status
 
-T2ME is early software. Treat new releases as operational infrastructure:
-test on a copy of the world, review configuration changes, and keep verified
-backups.
+`0.2.0-dev.1` is a development candidate, not a release. The next release
+requires:
 
-Bug reports should include the T2ME version, Forge version, relevant
-configuration, `/t2me status`, `/t2me metrics`, and a log excerpt:
+1. successful compile, unit, and integration validation;
+2. modpack-specific generation parity checks;
+3. controlled crash/restart recovery testing;
+4. the documented 10% median Chunky throughput win; and
+5. no unacceptable MSPT, heap, GC, disk, or error regression.
+
+Report defects with the T2ME commit, Forge version, mod list, configuration,
+`/t2me status`, `/t2me metrics`, benchmark run identifier, and relevant log:
 [open an issue](https://github.com/MimoAlexer/T2ME/issues).
 
-## License and clean-room statement
+## License
 
-T2ME is available under the [MIT License](LICENSE).
-
-The implementation does not copy or embed C2ME, Lithium, Canary, or Chunky
-code. Those projects remain independent and are governed by their respective
-licenses.
+T2ME is available under the [MIT License](LICENSE). External projects cited
+for comparison or architectural context are independent works under their own
+licenses. No external project code or binary is included in T2ME. Details are
+in [Third-party notices](THIRD_PARTY_NOTICES.md).

@@ -10,7 +10,6 @@ displayName="${mod_name}"
 displayURL="https://github.com/MimoAlexer/T2ME"
 authors="${mod_authors}"
 displayTest="IGNORE_SERVER_VERSION"
-accessTransformers=[]
 description='''${mod_description}'''
 
 [[dependencies.${mod_id}]]

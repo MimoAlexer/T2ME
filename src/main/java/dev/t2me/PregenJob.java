@@ -4,6 +4,7 @@ import net.minecraft.nbt.CompoundTag;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -13,6 +14,7 @@ import java.util.UUID;
 
 public final class PregenJob {
     private static final long ONE_SECOND_NANOS = 1_000_000_000L;
+    private static final int RATE_BUCKETS = 60;
 
     private final UUID id;
     private final String dimension;
@@ -21,13 +23,15 @@ public final class PregenJob {
     private final ArrayDeque<Long> retryQueue = new ArrayDeque<>();
     private final Map<Long, Integer> retryCounts = new HashMap<>();
     private final LinkedHashMap<Long, InFlight> inFlight = new LinkedHashMap<>();
-    private final ArrayDeque<Long> completionNanos = new ArrayDeque<>();
+    private final long[] completionBucketSeconds = new long[RATE_BUCKETS];
+    private final long[] completionBucketCounts = new long[RATE_BUCKETS];
 
     private JobState state;
     private long completed;
     private long failures;
     private String message;
     private long runStartedNanos;
+    private double latencyEwmaMillis;
 
     public PregenJob(
             String dimension,
@@ -88,6 +92,7 @@ public final class PregenJob {
                 snapshot.message()
         );
         snapshot.pending().forEach(job.retryQueue::addLast);
+        job.retryCounts.putAll(snapshot.retryCounts());
         return job;
     }
 
@@ -106,7 +111,7 @@ public final class PregenJob {
         return !retryQueue.isEmpty() || plan.hasNext();
     }
 
-    public void markInFlight(long packed, long startedNanos, UUID ticketId) {
+    public void markInFlight(long packed, long startedNanos, long ticketId) {
         if (inFlight.putIfAbsent(packed, new InFlight(startedNanos, ticketId)) != null) {
             throw new IllegalStateException("chunk already in flight: " + packed);
         }
@@ -114,14 +119,14 @@ public final class PregenJob {
 
     public Completion complete(
             long packed,
-            UUID ticketId,
+            long ticketId,
             boolean successful,
             String error,
             int maxRetries,
             long nowNanos
     ) {
         InFlight current = inFlight.get(packed);
-        if (current == null || !current.ticketId().equals(ticketId)) {
+        if (current == null || current.ticketId() != ticketId) {
             return Completion.IGNORED;
         }
         inFlight.remove(packed);
@@ -129,8 +134,14 @@ public final class PregenJob {
         if (successful) {
             completed++;
             retryCounts.remove(packed);
-            completionNanos.addLast(nowNanos);
-            pruneCompletionSamples(nowNanos);
+            recordCompletion(nowNanos);
+            double latencyMillis = Math.max(
+                    0.0D,
+                    (nowNanos - current.startedNanos()) / 1_000_000.0D
+            );
+            latencyEwmaMillis = latencyEwmaMillis == 0.0D
+                    ? latencyMillis
+                    : latencyEwmaMillis + 0.1D * (latencyMillis - latencyEwmaMillis);
             if (!hasDispatchableWork() && inFlight.isEmpty()) {
                 state = JobState.COMPLETED;
                 message = "completed";
@@ -180,6 +191,8 @@ public final class PregenJob {
         state = JobState.RUNNING;
         message = "running";
         runStartedNanos = System.nanoTime();
+        Arrays.fill(completionBucketSeconds, 0L);
+        Arrays.fill(completionBucketCounts, 0L);
         return true;
     }
 
@@ -220,15 +233,21 @@ public final class PregenJob {
     }
 
     public double completionsPerSecond(long windowSeconds, long nowNanos) {
-        pruneCompletionSamples(nowNanos);
-        long cutoff = nowNanos - windowSeconds * ONE_SECOND_NANOS;
-        int count = 0;
-        for (long completion : completionNanos) {
-            if (completion >= cutoff) {
-                count++;
+        long boundedWindow = Math.max(1L, Math.min(RATE_BUCKETS, windowSeconds));
+        long currentSecond = nowNanos / ONE_SECOND_NANOS;
+        long cutoffSecond = currentSecond - boundedWindow + 1L;
+        long count = 0L;
+        for (int index = 0; index < RATE_BUCKETS; index++) {
+            long bucketSecond = completionBucketSeconds[index];
+            if (bucketSecond >= cutoffSecond && bucketSecond <= currentSecond) {
+                count += completionBucketCounts[index];
             }
         }
-        return count / (double) windowSeconds;
+        double elapsedSeconds = Math.max(
+                1.0D,
+                Math.max(0L, nowNanos - runStartedNanos) / (double) ONE_SECOND_NANOS
+        );
+        return count / Math.min(boundedWindow, elapsedSeconds);
     }
 
     public Snapshot snapshot() {
@@ -247,7 +266,8 @@ public final class PregenJob {
                 state,
                 createdEpochMillis,
                 message,
-                pending
+                pending,
+                Map.copyOf(retryCounts)
         );
     }
 
@@ -311,21 +331,28 @@ public final class PregenJob {
         return runStartedNanos;
     }
 
-    private void pruneCompletionSamples(long nowNanos) {
-        long cutoff = nowNanos - 60L * ONE_SECOND_NANOS;
-        while (!completionNanos.isEmpty() && completionNanos.peekFirst() < cutoff) {
-            completionNanos.removeFirst();
+    public double latencyEwmaMillis() {
+        return latencyEwmaMillis;
+    }
+
+    private void recordCompletion(long nowNanos) {
+        long second = nowNanos / ONE_SECOND_NANOS;
+        int index = (int) Math.floorMod(second, RATE_BUCKETS);
+        if (completionBucketSeconds[index] != second) {
+            completionBucketSeconds[index] = second;
+            completionBucketCounts[index] = 0L;
         }
+        completionBucketCounts[index]++;
     }
 
     private static String coordinateText(long packed) {
         return SpiralChunkPlan.unpackX(packed) + "," + SpiralChunkPlan.unpackZ(packed);
     }
 
-    private record InFlight(long startedNanos, UUID ticketId) {
+    private record InFlight(long startedNanos, long ticketId) {
     }
 
-    public record TicketReference(long packed, UUID ticketId) {
+    public record TicketReference(long packed, long ticketId) {
     }
 
     public enum Completion {
@@ -348,8 +375,14 @@ public final class PregenJob {
             JobState state,
             long createdEpochMillis,
             String message,
-            List<Long> pending
+            List<Long> pending,
+            Map<Long, Integer> retryCounts
     ) {
+        public Snapshot {
+            pending = List.copyOf(pending);
+            retryCounts = Map.copyOf(retryCounts);
+        }
+
         public CompoundTag save() {
             CompoundTag tag = new CompoundTag();
             tag.putUUID("Id", id);
@@ -369,6 +402,16 @@ public final class PregenJob {
                 pendingArray[index] = pending.get(index);
             }
             tag.putLongArray("Pending", pendingArray);
+            long[] retryCoordinates = new long[retryCounts.size()];
+            int[] retryAttempts = new int[retryCounts.size()];
+            int retryIndex = 0;
+            for (Map.Entry<Long, Integer> entry : retryCounts.entrySet()) {
+                retryCoordinates[retryIndex] = entry.getKey();
+                retryAttempts[retryIndex] = entry.getValue();
+                retryIndex++;
+            }
+            tag.putLongArray("RetryCoordinates", retryCoordinates);
+            tag.putIntArray("RetryAttempts", retryAttempts);
             return tag;
         }
 
@@ -377,6 +420,15 @@ public final class PregenJob {
             List<Long> pending = new ArrayList<>(pendingArray.length);
             for (long packed : pendingArray) {
                 pending.add(packed);
+            }
+            long[] retryCoordinates = tag.getLongArray("RetryCoordinates");
+            int[] retryAttempts = tag.getIntArray("RetryAttempts");
+            Map<Long, Integer> retryCounts = new HashMap<>();
+            int retryLength = Math.min(retryCoordinates.length, retryAttempts.length);
+            for (int index = 0; index < retryLength; index++) {
+                if (retryAttempts[index] > 0) {
+                    retryCounts.put(retryCoordinates[index], retryAttempts[index]);
+                }
             }
             return new Snapshot(
                     tag.hasUUID("Id") ? tag.getUUID("Id") : UUID.randomUUID(),
@@ -391,7 +443,8 @@ public final class PregenJob {
                     JobState.valueOf(tag.getString("State")),
                     tag.getLong("CreatedEpochMillis"),
                     tag.getString("Message"),
-                    List.copyOf(pending)
+                    List.copyOf(pending),
+                    Map.copyOf(retryCounts)
             );
         }
     }
