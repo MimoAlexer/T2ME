@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="320" viewBox="0 0 960 320" role="img" aria-labelledby="title description">
+  <title id="title">T2ME</title>
+  <desc id="description">Threaded Task Management Engine logo with connected Minecraft-style chunks.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#18243c"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="960" height="320" rx="36" fill="url(#background)"/>
+  <path d="M42 252H918" stroke="#334155" stroke-width="2" stroke-dasharray="8 10"/>
+
+  <g transform="translate(58 54)">
+    <path d="M70 38L134 2l64 36-64 36z" fill="#22d3ee" opacity=".95"/>
+    <path d="M70 38v72l64 36V74z" fill="#0891b2"/>
+    <path d="M198 38v72l-64 36V74z" fill="#6d28d9"/>
+
+    <path d="M10 136l45-25 45 25-45 25z" fill="#38bdf8"/>
+    <path d="M10 136v50l45 25v-50z" fill="#0284c7"/>
+    <path d="M100 136v50l-45 25v-50z" fill="#4f46e5"/>
+
+    <path d="M170 150l45-25 45 25-45 25z" fill="#a78bfa"/>
+    <path d="M170 150v50l45 25v-50z" fill="#7c3aed"/>
+    <path d="M260 150v50l-45 25v-50z" fill="#4338ca"/>
+
+    <g fill="none" stroke="url(#accent)" stroke-width="8" stroke-linecap="round" filter="url(#glow)">
+      <path d="M55 112V82h79"/>
+      <path d="M134 146v24h36"/>
+      <path d="M198 86h34v39"/>
+    </g>
+    <g fill="#e0f2fe">
+      <circle cx="55" cy="112" r="7"/>
+      <circle cx="134" cy="82" r="7"/>
+      <circle cx="134" cy="170" r="7"/>
+      <circle cx="170" cy="170" r="7"/>
+      <circle cx="198" cy="86" r="7"/>
+      <circle cx="232" cy="125" r="7"/>
+    </g>
+  </g>
+
+  <g transform="translate(365 78)">
+    <text x="0" y="86" fill="#f8fafc" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="104" font-weight="800" letter-spacing="4">T2ME</text>
+    <rect x="2" y="108" width="492" height="5" rx="2.5" fill="url(#accent)"/>
+    <text x="2" y="154" fill="#cbd5e1" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="25" font-weight="600" letter-spacing="1.5">THREADED TASK MANAGEMENT ENGINE</text>
+    <text x="2" y="196" fill="#94a3b8" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="20">Safe, adaptive Forge chunk pregeneration</text>
+  </g>
+</svg>

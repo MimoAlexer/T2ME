@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a reproducible T2ME problem.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve T2ME. Remove passwords, addresses, player IPs,
+        and other secrets before attaching logs.
+  - type: input
+    id: t2me-version
+    attributes:
+      label: T2ME version
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Minecraft, Forge, and Java versions
+      placeholder: "Minecraft 1.20.1, Forge 47.4.21, Java 17"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Include what you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Start a job with ...
+        2. Wait until ...
+        3. Run ...
+    validations:
+      required: true
+  - type: textarea
+    id: mods
+    attributes:
+      label: Other server mods
+      description: Paste the relevant mod list, especially performance and pregeneration mods.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Attach latest.log or paste the smallest relevant excerpt.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Final checks
+      options:
+        - label: I removed secrets and personal information from the report.
+          required: true
+        - label: I searched existing issues for the same problem.
+          required: true

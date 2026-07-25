@@ -1,0 +1,30 @@
+# Build and run output
+.gradle/
+build/
+out/
+run/
+run-data/
+logs/
+crash-reports/
+
+# IDEs and operating systems
+.idea/
+.vscode/
+.settings/
+.metadata/
+.classpath
+.project
+*.iml
+*.ipr
+*.iws
+*.launch
+.DS_Store
+Thumbs.db
+
+# Local-only files
+eclipse/
+bin/
+*.log
+*.tmp
+*.bak
+mcmodsrepo/
