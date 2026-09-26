@@ -20,8 +20,9 @@ responsiveness**.
 
 > [!IMPORTANT]
 > T2ME is not a Forge port of C2ME or Lithium. It does not replace Minecraft's
-> terrain generator, patch game logic, or write region files from custom
-> threads. See [Architecture](docs/ARCHITECTURE.md) for the exact threading
+> terrain generator or write region files from custom threads. A narrow NBT
+> ownership fix isolates chunk reads from pending disk writes. See
+> [Architecture](docs/ARCHITECTURE.md) for the exact threading
 > boundary.
 
 ## Highlights
@@ -41,6 +42,7 @@ responsiveness**.
 - Stalled-request detection and bounded retries without silently skipping the
   affected coordinate.
 - Validated checkpoints that retain unreadable job data for operator inspection.
+- Isolated chunk-load NBT to prevent reloads from mutating a pending save.
 - A compatibility guard for known pregenerators and invasive threading mods.
 - Server-only installation; unmodified clients can connect.
 
@@ -117,7 +119,7 @@ All commands require permission level `4` by default.
 | `/t2me pregen cancel` | Release T2ME tickets and permanently cancel the current job. |
 | `/t2me pregen status` | Show the same detailed job status as `/t2me status`. |
 | `/t2me status` | Show state, target, progress, in-flight work, retries, CPS, ETA, throttle reason, and last message. |
-| `/t2me metrics` | Add tick EWMA, decaying tick peak, admission limit, heap headroom, and player count to job status. |
+| `/t2me metrics` | Add tick EWMA, decaying tick peak, admission limit, heap headroom, player count, and per-job throttle counters to job status. |
 | `/t2me config show` | Show the most important live configuration values. |
 
 `radiusBlocks` must be from `16` through `20,000`. The center plus radius must
@@ -253,8 +255,9 @@ Run the Forge integration test server separately:
 ```
 
 On Linux/macOS, use `./gradlew runGameTestServer`. This exercises real chunk
-generation, pause/resume, saved checkpoint reload, cancellation, and world
-saving. The GameTest sources and fixtures are separate from the production JAR.
+generation, pause/resume, saved checkpoint reload, cancellation, world saving,
+and pending-save NBT isolation. The GameTest sources and fixtures are separate
+from the production JAR.
 
 ## Project status
 

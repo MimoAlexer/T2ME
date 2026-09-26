@@ -7,8 +7,10 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import queue
 import struct
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -19,6 +21,8 @@ import zlib
 SPEC = importlib.util.spec_from_file_location("benchmark_server", Path(__file__).with_name("benchmark-server.py"))
 benchmark = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(benchmark)
+
+STORAGE_ERROR = "[13:28:52] [IO-Worker-29/ERROR] [minecraft/IOWorker]: Failed to store chunk [514, 524]"
 
 
 def string(value):
@@ -215,8 +219,46 @@ class TemplateIsolationTests(TemporaryBenchmark):
         self.assertTrue((self.world / "session.lock").exists())
 
 
+class ConsoleErrorTests(TemporaryBenchmark):
+    def test_error_severity_and_storage_failures_rejected_without_rejecting_forge_warnings(self):
+        for line in (STORAGE_ERROR, "[main/FATAL] Loader failed", "[ERROR] Cannot save world",
+                     "2026-09-26 13:28:19,879 main ERROR Logging initialization failed",
+                     "[IO-Worker-3/WARN] Failed to save chunk [1, 2]",
+                     "\x1b[31m[Server thread/ERROR] Unexpected failure\x1b[0m",
+                     'Exception in thread "IO-Worker-1" java.lang.IllegalStateException'):
+            with self.subTest(line=line):
+                self.assertTrue(benchmark.is_server_error(line))
+        for line in ("2026-09-26 13:28:19,879 main WARN Advanced terminal features are not available in this environment",
+                     "[main/WARN] Mod file fmlcore.jar is missing mods.toml file",
+                     "[main/WARN] Assets URL uses unexpected schema",
+                     "[Server thread/INFO] Completed successfully; no ERROR logs reported",
+                     "[Server thread/INFO] Saved the game"):
+            with self.subTest(line=line):
+                self.assertFalse(benchmark.is_server_error(line))
+
+    def test_live_queue_rejects_error_before_consuming_later_success(self):
+        server = benchmark.Server.__new__(benchmark.Server)
+        server.lines = queue.Queue()
+        server.lines.put((1.0, STORAGE_ERROR))
+        server.lines.put((2.0, "Saved the game"))
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "Server logged an error"):
+            server.next_line(time.perf_counter() + 1)
+        self.assertEqual(1, server.lines.qsize())
+
+    def test_log_audit_keeps_error_line_numbers_after_recovered_save(self):
+        log = self.root / "console.log"
+        text = ("[main/WARN] Normal startup warning\n" + STORAGE_ERROR
+                + "\njava.util.ConcurrentModificationException: null\n"
+                + "\tat net.minecraft.nbt.CompoundTag.write(CompoundTag.java:133)\n"
+                + "[Server thread/INFO] Saved the game\n")
+        log.write_text(text, encoding="utf-8")
+        self.assertEqual([{"line": 2, "text": STORAGE_ERROR}], benchmark.scan_server_errors(log))
+        self.assertEqual(text, log.read_text(encoding="utf-8"))
+
+
 class RunVerificationTests(TemporaryBenchmark):
-    def run_with_console(self, candidate, lines, save_on_flush=True, save_on_stop=False):
+    def run_with_console(self, candidate, lines, save_on_flush=True, save_on_stop=False,
+                         startup_error=None, flush_error=None, shutdown_error=None):
         args = self.make_args()
         args.output.mkdir()
         chunks = benchmark.coordinates(args)
@@ -227,6 +269,12 @@ class RunVerificationTests(TemporaryBenchmark):
                 self.world = directory / "benchmark-world"
                 self.lines = deque(lines)
                 self.flushes = 0
+                self.log_path = run / "console.log"
+                self.log_path.write_text("", encoding="utf-8")
+
+            def record(self, line):
+                with self.log_path.open("a", encoding="utf-8") as log:
+                    log.write(line + "\n")
 
             def send(self, command):
                 commands.append(command)
@@ -236,6 +284,10 @@ class RunVerificationTests(TemporaryBenchmark):
                         write_chunks(self.world, chunks)
 
             def wait(self, pattern, timeout):
+                error = startup_error if self.flushes == 0 else flush_error if self.flushes == 2 else None
+                if error:
+                    self.record(error)
+                    benchmark.reject_server_error(error)
                 return 15.0
 
             def barrier(self, timeout):
@@ -244,12 +296,17 @@ class RunVerificationTests(TemporaryBenchmark):
             def next_line(self, deadline):
                 if not self.lines:
                     raise benchmark.BenchmarkError("Timeout: no recognized completion")
-                return 12.0, self.lines.popleft()
+                line = self.lines.popleft()
+                self.record(line)
+                benchmark.reject_server_error(line)
+                return 12.0, line
 
             def stop(self, timeout):
                 events.append("stop")
                 if save_on_stop:
                     write_chunks(self.world, chunks)
+                if shutdown_error:
+                    self.record(shutdown_error)
                 return True
 
         actual_verify = benchmark.verify_full_chunks
@@ -309,6 +366,46 @@ class RunVerificationTests(TemporaryBenchmark):
         self.assertIn("Missing region", result["error"])
         self.assertEqual(["verify", "stop"], events)
         self.assertTrue(result["clean_shutdown"])
+
+    def test_storage_error_aborts_early_even_if_shutdown_repairs_world(self):
+        result, events, commands = self.run_with_console(
+            "t2me", [STORAGE_ERROR, "T2ME job=id state=completed done=25/25"], save_on_stop=True)
+        self.assertFalse(result["success"])
+        self.assertTrue(result["clean_shutdown"])
+        self.assertEqual(["stop"], events)
+        self.assertEqual(1, commands.count("save-all flush"))
+        self.assertEqual([{"line": 1, "text": STORAGE_ERROR}], result["server_errors"])
+        self.assertNotIn("completion_seconds", result)
+        saved = json.loads((Path(result["directory"]) / "result.json").read_text(encoding="utf-8"))
+        self.assertFalse(saved["success"])
+        self.assertEqual(result["server_errors"], saved["server_errors"])
+
+    def test_startup_error_prevents_pregeneration_but_still_stops(self):
+        result, events, commands = self.run_with_console(
+            "t2me", [], startup_error="[main/ERROR] Failed to load registries")
+        self.assertFalse(result["success"])
+        self.assertEqual(["stop"], events)
+        self.assertEqual([], commands)
+        self.assertEqual(1, len(result["server_errors"]))
+
+    def test_flush_storage_error_invalidates_reported_completion(self):
+        result, events, _ = self.run_with_console(
+            "t2me", ["T2ME job=id state=completed done=25/25"], flush_error=STORAGE_ERROR)
+        self.assertFalse(result["success"])
+        self.assertEqual(2.0, result["completion_seconds"])
+        self.assertNotIn("verified_full_chunks", result)
+        self.assertEqual(["stop"], events)
+        self.assertEqual(1, len(result["server_errors"]))
+
+    def test_shutdown_error_invalidates_full_verified_world_and_removes_speed_metrics(self):
+        result, events, _ = self.run_with_console(
+            "t2me", ["T2ME job=id state=completed done=25/25"], shutdown_error=STORAGE_ERROR)
+        self.assertFalse(result["success"])
+        self.assertEqual(25, result["verified_full_chunks"])
+        self.assertEqual(["verify", "stop"], events)
+        self.assertEqual(1, len(result["server_errors"]))
+        self.assertNotIn("completion_cps", result)
+        self.assertNotIn("completion_and_flush_cps", result)
 
 
 class ComparisonReportTests(TemporaryBenchmark):

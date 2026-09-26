@@ -34,6 +34,7 @@ pipeline, the region-file layer, or an engine optimization mod.
 | `CompletionMailbox` | Transfers immutable completion results to the server tick and discards late results after closure. |
 | `CompatibilityGuard` | Detects known competing pregenerators and invasive threading mods. |
 | `T2MEData` | Stores one job snapshot using overworld `SavedData`. |
+| Chunk-load NBT mixin | Gives load consumers their own NBT object instead of exposing data shared with a pending disk write. |
 
 ## Request flow
 
@@ -99,6 +100,26 @@ The completion handler ignores a different job UUID. Tickets additionally
 include a unique issuance UUID so a cancelled or retried request cannot collide
 with a later request for the same coordinate.
 
+## Chunk-load NBT ownership
+
+Minecraft 1.20.1's `IOWorker.loadAsync` can return the exact `CompoundTag`
+held by a pending write. `ChunkStorage.upgradeChunkTag` then adds and removes
+the root `__context` key. If the I/O worker is serializing the same tag,
+iteration can fail with `ConcurrentModificationException`. A larger
+pregeneration test exposed this during chunk unloading and reloading.
+
+T2ME wraps the load result with a synchronous continuation that deep-copies
+present NBT. Each load operation can then upgrade its own tag without mutating the
+pending writer's object. Empty results and exceptional completion retain their
+normal behavior. This also covers loads unrelated to T2ME while the mod is
+installed. It adds no executor and performs no region-file I/O itself.
+
+The mixin is required: a missing target causes startup to fail rather than
+silently omitting the ownership fix. Forge integration tests verify the
+transformed runtime, and packaged-server benchmarks check the reobfuscated
+JAR. This is a narrowly scoped storage correctness fix, not a terrain
+generation algorithm change.
+
 ## Planning model
 
 `SpiralChunkPlan` enumerates a deterministic square spiral centered on the
@@ -149,7 +170,9 @@ Admission is adjusted in this order:
    reserve.
 2. Stop immediately when either the latest tick or EWMA reaches
    `hardStopTickMillis`. Require 20 consecutive ticks with both measurements at
-   or below 90% of the target before resuming. Hard stops reset the window to one.
+   or below 90% of the target before resuming. Restore at most four requests,
+   never more than the pre-stop window or current configured ceiling. Any
+   intervening heap pressure forces recovery at one request.
 3. Halve the window when either tick measurement reaches `targetTickMillis`,
    at most once every five recorded ticks. If thresholds are reversed, use
    `hardStopTickMillis - 1` as the effective target.

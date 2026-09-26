@@ -351,15 +351,21 @@ public final class PregenService {
 
     public String metricsLine() {
         double headroomGiB = lastDecision.heapHeadroomBytes() / (1024.0D * 1024.0D * 1024.0D);
+        AdaptiveLimiter.Telemetry telemetry = limiter.telemetry();
         return String.format(
                 Locale.ROOT,
                 "T2ME metrics: tickEWMA=%.2fms tickPeak=%.2fms admission=%d "
-                        + "heapHeadroom=%.2fGiB players=%d | %s",
+                        + "heapHeadroom=%.2fGiB players=%d activeTicks=%d "
+                        + "msptBlockedTicks=%d heapBlockedTicks=%d softBackoffs=%d | %s",
                 limiter.tickEwmaMillis(),
                 limiter.tickPeakMillis(),
                 lastDecision.maxInFlight(),
                 headroomGiB,
                 server == null ? 0 : server.getPlayerCount(),
+                telemetry.activeTicks(),
+                telemetry.tickStoppedTicks(),
+                telemetry.heapStoppedTicks(),
+                telemetry.softBackoffs(),
                 statusLine()
         );
     }
@@ -515,7 +521,7 @@ public final class PregenService {
         if (completion == PregenJob.Completion.PAUSED) {
             T2ME.LOGGER.error("{}", job.message());
         } else if (job.state() == JobState.COMPLETED) {
-            T2ME.LOGGER.info("Completed {}", statusLine());
+            T2ME.LOGGER.info("Completed {}", metricsLine());
         }
     }
 

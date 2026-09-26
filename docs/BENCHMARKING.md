@@ -114,6 +114,10 @@ The harness refuses a comparison unless all of the following hold:
   `minecraft:full` immediately after that flush, before the additional save
   performed by server shutdown.
 - Every benchmark process shuts down successfully.
+- No server `ERROR`/`FATAL` or chunk storage-failure message appears from startup
+  through shutdown. A later successful save does not excuse an earlier failure.
+  Matching console lines are recorded in `result.json`; the complete log and
+  stack traces are retained in `console.log`.
 
 Completion counts alone are insufficient: pregenerators can report processing
 a chunk that was skipped or failed. The persisted FULL check detects holes in

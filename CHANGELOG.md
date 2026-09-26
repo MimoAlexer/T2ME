@@ -16,13 +16,20 @@ All notable changes to T2ME are documented here. The project follows
 - Adapt the in-flight window gradually up to the configured limit. Defaults are
   32 in flight and 16 admissions per tick, with an absolute bound of 256.
 - Back off immediately after a slow tick; require sustained recovery before
-  restarting. Scale heap reserve for small JVM heaps and retain player backoff.
+  restarting at no more than the previous startup-sized window. Heap pressure
+  restarts at one request. Scale heap reserve for small JVM heaps and retain
+  player backoff.
 - Batch worker completions through a job-specific mailbox on the server thread,
   with one snapshot per batch. Include scheduler overhead in tick health.
 - Bound rate-tracking memory with fixed 100 ms buckets.
+- Include per-job active ticks, tick/heap admission stops, and soft backoffs in
+  metrics and completion logs to explain observed throughput.
 
 ### Fixed
 
+- Isolate chunk-load NBT from pending I/O writes. Minecraft's reload upgrade
+  path mutates root metadata; sharing that object with a pending save can
+  otherwise cause `ConcurrentModificationException` during serialization.
 - Retain every polled coordinate and retry count across checkpoints.
 - Reject inconsistent saved progress, preserve unreadable job data, and report
   recovery errors in status. Explicit cancellation is required to discard it.
@@ -41,6 +48,8 @@ All notable changes to T2ME are documented here. The project follows
   run it. The test classes are excluded from the production JAR.
 - Added a reproducible planner microbenchmark. Planner results do not establish
   world-generation speed relative to Chunky.
+- Reject server errors during comparison startup, generation, saving, and
+  shutdown, even when a subsequent flush produces all requested FULL chunks.
 
 ## [0.1.0] - 2026-07-25
 

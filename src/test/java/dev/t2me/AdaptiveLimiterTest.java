@@ -57,6 +57,67 @@ class AdaptiveLimiterTest {
         for (int tick = 0; tick < 19; tick++) {
             assertEquals(0, tick(limiter, 5).maxInFlight());
         }
+        assertEquals(4, tick(limiter, 5).maxInFlight());
+    }
+
+    @Test
+    void repeatedHardSpikesRestartRecoveryWithoutLosingThePreviousWindow() {
+        AdaptiveLimiter limiter = warmedLimiter();
+        assertEquals(0, tick(limiter, 60).maxInFlight());
+        for (int tick = 0; tick < 10; tick++) {
+            assertEquals(0, tick(limiter, 5).maxInFlight());
+        }
+        assertEquals(0, tick(limiter, 60).maxInFlight());
+        for (int tick = 0; tick < 19; tick++) {
+            assertEquals(0, tick(limiter, 5).maxInFlight());
+        }
+        assertEquals(4, tick(limiter, 5).maxInFlight());
+    }
+
+    @Test
+    void hardStopRecoveryRespectsALoweredConfigurationCeiling() {
+        AdaptiveLimiter limiter = warmedLimiter();
+        assertEquals(0, tick(limiter, 60).maxInFlight());
+        AdaptiveLimiter.Settings reduced = settings(2);
+        for (int tick = 0; tick < 19; tick++) {
+            limiter.recordTick(5_000_000L);
+            assertEquals(0, limiter.decide(reduced, HEALTHY_HEADROOM, MAX_HEAP, 0, true).maxInFlight());
+        }
+        limiter.recordTick(5_000_000L);
+        assertEquals(2, limiter.decide(reduced, HEALTHY_HEADROOM, MAX_HEAP, 0, true).maxInFlight());
+    }
+
+    @Test
+    void hardStopRecoveryPreservesASmallerPreStopWindow() {
+        AdaptiveLimiter limiter = new AdaptiveLimiter();
+        for (int tick = 0; tick < 5; tick++) {
+            tick(limiter, 5);
+        }
+        assertEquals(2, tick(limiter, 46).maxInFlight());
+        assertEquals(0, tick(limiter, 60).maxInFlight());
+        for (int tick = 0; tick < 5; tick++) {
+            assertEquals(0, tick(limiter, 5).maxInFlight());
+        }
+        assertEquals(0, tick(limiter, 60).maxInFlight());
+        for (int tick = 0; tick < 19; tick++) {
+            assertEquals(0, tick(limiter, 5).maxInFlight());
+        }
+        assertEquals(2, tick(limiter, 5).maxInFlight());
+    }
+
+    @Test
+    void overlappingHeapPressureForcesTickRecoveryBackToOne() {
+        AdaptiveLimiter limiter = warmedLimiter();
+        assertEquals(0, tick(limiter, 60).maxInFlight());
+        for (int tick = 0; tick < 10; tick++) {
+            assertEquals(0, tick(limiter, 5).maxInFlight());
+        }
+        assertEquals(0, limiter.decide(DEFAULTS, 1023L * MIB, MAX_HEAP, 0, true).maxInFlight());
+        // A further hard spike cannot restore the pre-memory-pressure window.
+        assertEquals(0, tick(limiter, 60).maxInFlight());
+        for (int tick = 0; tick < 19; tick++) {
+            assertEquals(0, tick(limiter, 5).maxInFlight());
+        }
         assertEquals(1, tick(limiter, 5).maxInFlight());
     }
 
@@ -172,6 +233,32 @@ class AdaptiveLimiterTest {
         assertEquals(0.0D, limiter.tickEwmaMillis());
         assertThrows(IllegalArgumentException.class,
                 () -> limiter.decide(DEFAULTS, 0L, 0L, 0, true));
+    }
+
+    @Test
+    void telemetryCountsOnlyFreshActiveTicksAndResetsWithoutRemovingPressure() {
+        AdaptiveLimiter limiter = new AdaptiveLimiter();
+        limiter.recordTick(5_000_000L);
+        limiter.decide(DEFAULTS, HEALTHY_HEADROOM, MAX_HEAP, 0, false);
+        assertEquals(new AdaptiveLimiter.Telemetry(0L, 0L, 0L, 0L), limiter.telemetry());
+        tick(limiter, 5);
+        for (int repeat = 0; repeat < 50; repeat++) {
+            decide(limiter);
+        }
+        assertEquals(new AdaptiveLimiter.Telemetry(1L, 0L, 0L, 0L), limiter.telemetry());
+        tick(limiter, 46);
+        tick(limiter, 60);
+        tick(limiter, 5);
+        limiter.recordTick(5_000_000L);
+        limiter.decide(DEFAULTS, 1023L * MIB, MAX_HEAP, 0, true);
+        assertEquals(new AdaptiveLimiter.Telemetry(5L, 2L, 1L, 1L), limiter.telemetry());
+        limiter.resetAdmission();
+        assertEquals(new AdaptiveLimiter.Telemetry(0L, 0L, 0L, 0L), limiter.telemetry());
+        assertEquals(0, decide(limiter).maxInFlight());
+        assertEquals(new AdaptiveLimiter.Telemetry(0L, 0L, 0L, 0L), limiter.telemetry());
+        limiter.reset();
+        assertEquals(new AdaptiveLimiter.Telemetry(0L, 0L, 0L, 0L), limiter.telemetry());
+        assertEquals(4, decide(limiter).maxInFlight());
     }
 
     private static AdaptiveLimiter warmedLimiter() {

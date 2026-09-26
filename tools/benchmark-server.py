@@ -30,6 +30,31 @@ class BenchmarkError(RuntimeError):
     pass
 
 
+def normalize_console_line(line: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m|§.", "", line).rstrip()
+
+
+def is_server_error(line: str) -> bool:
+    line = normalize_console_line(line)
+    severity = r"\[(?:[^\]\r\n]*(?:/|\s))?(?:ERROR|FATAL)\]|^\s*(?:ERROR|FATAL)\b"
+    startup_severity = r"^\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(?:[.,]\d+)?\s+\S+\s+(?:ERROR|FATAL)\b"
+    storage_failure = r"\bFailed to (?:store|save|write|read|load) chunk\b"
+    return bool(re.search(severity, line) or re.search(startup_severity, line)
+                or re.search(storage_failure, line, re.IGNORECASE)
+                or line.startswith("Exception in thread "))
+
+
+def reject_server_error(line: str) -> None:
+    if is_server_error(line):
+        raise BenchmarkError("Server logged an error: " + normalize_console_line(line))
+
+
+def scan_server_errors(path: Path) -> list[dict]:
+    with path.open(encoding="utf-8", errors="replace") as log:
+        return [{"line": number, "text": normalize_console_line(line)}
+                for number, line in enumerate(log, start=1) if is_server_error(line)]
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -227,7 +252,7 @@ class Server:
                 timestamp = time.perf_counter()
                 self.log.write(line)
                 self.log.flush()
-                plain = re.sub(r"\x1b\[[0-9;]*m|§.", "", line).rstrip()
+                plain = normalize_console_line(line)
                 self.lines.put((timestamp, plain))
         finally:
             self.lines.put((time.perf_counter(), None))
@@ -250,6 +275,7 @@ class Server:
             raise BenchmarkError("Timed out waiting for the server; inspect console.log") from error
         if line is None:
             raise BenchmarkError(f"Server output closed (exit={self.process.poll()})")
+        reject_server_error(line)
         return timestamp, line
 
     def wait(self, pattern, timeout):
@@ -289,7 +315,7 @@ class Server:
             self.commands.close()
             if not self.reader.is_alive():
                 self.log.close()
-        return clean and self.process.returncode == 0
+        return clean and self.process.returncode == 0 and not self.reader.is_alive()
 
 
 def run_candidate(args, candidate: str, number: int, chunks) -> dict:
@@ -365,7 +391,27 @@ def run_candidate(args, candidate: str, number: int, chunks) -> dict:
             result["interrupted"] = True
     finally:
         if server is not None:
-            result["clean_shutdown"] = server.stop(args.shutdown_timeout)
+            try:
+                result["clean_shutdown"] = server.stop(args.shutdown_timeout)
+            except Exception as error:
+                result["clean_shutdown"] = False
+                result["shutdown_error"] = f"{type(error).__name__}: {error}"
+        # A later retry or the final shutdown save must not turn an earlier
+        # storage/generation error into an apparently successful benchmark.
+        # Audit the complete log after stop, including errors after completion.
+        console_log = run / "console.log"
+        if console_log.exists():
+            result["server_errors"] = scan_server_errors(console_log)
+            if result["server_errors"]:
+                result["success"] = False
+                result["error"] = (f"Server logged {len(result['server_errors'])} error(s); "
+                                   f"console.log:{result['server_errors'][0]['line']}: "
+                                   + result["server_errors"][0]["text"])
+                result.pop("completion_cps", None)
+                result.pop("completion_and_flush_cps", None)
+        elif result["success"]:
+            result["success"] = False
+            result["error"] = "Missing console.log; cannot audit server errors"
         (run / "result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     return result
 

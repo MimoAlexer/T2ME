@@ -23,8 +23,13 @@ public final class AdaptiveLimiter {
     private int window;
     private int healthyTicks;
     private int recoveryTicks;
+    private int tickRecoveryWindow = 1;
     private boolean heapStopped;
     private boolean tickStopped;
+    private long activeTicks;
+    private long tickStoppedTicks;
+    private long heapStoppedTicks;
+    private long softBackoffs;
 
     public void reset() {
         tickEwmaMillis = 0.0D;
@@ -36,14 +41,17 @@ public final class AdaptiveLimiter {
         window = 0;
         healthyTicks = 0;
         recoveryTicks = 0;
+        tickRecoveryWindow = 1;
         heapStopped = false;
         tickStopped = false;
+        resetTelemetry();
     }
 
     /** Starts a new job conservatively without forgetting current server-health pressure. */
     public void resetAdmission() {
         window = heapStopped || tickStopped ? 1 : 0;
         healthyTicks = 0;
+        resetTelemetry();
     }
 
     public void recordTick(long elapsedNanos) {
@@ -96,6 +104,10 @@ public final class AdaptiveLimiter {
         long headroom = Math.max(0L, Math.min(maxHeapBytes, heapHeadroomBytes));
         boolean freshSample = samples != lastDecisionSample;
         lastDecisionSample = samples;
+        boolean activeSample = freshSample && samples > 0L && active;
+        if (activeSample) {
+            activeTicks++;
+        }
         if (window == 0) {
             window = Math.min(INITIAL_WINDOW, settings.maxInFlight());
         }
@@ -109,7 +121,12 @@ public final class AdaptiveLimiter {
         );
         if (headroom < reserve || (heapStopped && headroom < reserve + recoveryMargin)) {
             heapStopped = true;
+            // Memory pressure overrides any concurrency remembered before a tick stop.
+            tickRecoveryWindow = 1;
             backOffToMinimum();
+            if (activeSample) {
+                heapStoppedTicks++;
+            }
             return new Decision(0, "low heap headroom", headroom);
         }
         heapStopped = false;
@@ -119,8 +136,16 @@ public final class AdaptiveLimiter {
         double recoveryTarget = target * RECOVERY_FRACTION;
         if (samples > 0L && (latestTickMillis >= settings.hardStopTickMillis()
                 || tickEwmaMillis >= settings.hardStopTickMillis())) {
+            if (!tickStopped) {
+                // After sustained recovery, reuse only the already-proven startup-sized
+                // window. Repeated spikes must not overwrite it with the stopped window.
+                tickRecoveryWindow = Math.min(INITIAL_WINDOW, window);
+            }
             tickStopped = true;
             backOffToMinimum();
+            if (activeSample) {
+                tickStoppedTicks++;
+            }
             return new Decision(0, "MSPT hard stop", headroom);
         }
 
@@ -134,15 +159,22 @@ public final class AdaptiveLimiter {
                 recoveryTicks++;
             }
             if (recoveryTicks < RECOVERY_TICKS) {
+                if (activeSample) {
+                    tickStoppedTicks++;
+                }
                 return new Decision(0, "MSPT recovery", headroom);
             }
             tickStopped = false;
             recoveryTicks = 0;
+            window = Math.min(tickRecoveryWindow, settings.maxInFlight());
         }
 
         if (samples > 0L && (latestTickMillis >= target || tickEwmaMillis >= target)) {
             healthyTicks = 0;
             if (freshSample && samples - lastBackoffSample >= BACKOFF_INTERVAL_TICKS) {
+                if (activeSample && window > 1) {
+                    softBackoffs++;
+                }
                 window = Math.max(1, window / 2);
                 lastBackoffSample = samples;
             }
@@ -184,6 +216,21 @@ public final class AdaptiveLimiter {
 
     public double tickPeakMillis() {
         return tickPeakMillis;
+    }
+
+    /** Counters for the current job; inactive ticks and repeated decisions are excluded. */
+    public Telemetry telemetry() {
+        return new Telemetry(activeTicks, tickStoppedTicks, heapStoppedTicks, softBackoffs);
+    }
+
+    private void resetTelemetry() {
+        activeTicks = 0L;
+        tickStoppedTicks = 0L;
+        heapStoppedTicks = 0L;
+        softBackoffs = 0L;
+    }
+
+    public record Telemetry(long activeTicks, long tickStoppedTicks, long heapStoppedTicks, long softBackoffs) {
     }
 
     public record Settings(

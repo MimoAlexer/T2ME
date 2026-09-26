@@ -34,7 +34,7 @@ server.
 | Pause and resume | Yes | Yes | Not applicable | Not applicable |
 | Persistent progress after normal restart | Yes | Yes in supported Chunky versions/configurations | No job to persist | No job to persist |
 | CPS, ETA, in-flight, retry, MSPT, heap, and throttle metrics | Yes, in command output | Progress/rate reporting; exact metrics differ | No pregen job metrics | No pregen job metrics |
-| Low-level mixins/engine patches | No | Not its primary role | Yes | Yes |
+| Low-level mixins/engine patches | One chunk-load NBT ownership fix; no terrain algorithm replacement | Not its primary role | Yes | Yes |
 | Direct custom region-file generation in T2ME's model | No | Uses its platform-specific generation workflow | No pregen | No pregen |
 | Runs alongside T2ME by default | Not applicable | Blocked to avoid competing pregenerators | Loader/version dependent | Allowed and detected |
 | Code embedded in T2ME | T2ME clean-room code only | No | No | No |

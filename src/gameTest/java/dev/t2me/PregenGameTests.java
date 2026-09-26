@@ -3,13 +3,87 @@ package dev.t2me;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.util.thread.ProcessorMailbox;
+import net.minecraft.util.thread.StrictQueue;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.chunk.storage.IOWorker;
+import net.minecraftforge.fml.util.ObfuscationReflectionHelper;
 import net.minecraftforge.gametest.GameTestHolder;
 import net.minecraftforge.gametest.PrefixGameTestTemplate;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Comparator;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /** Runs only in the development GameTest source set; never shipped in the mod. */
 @GameTestHolder(T2ME.MOD_ID)
 @PrefixGameTestTemplate(false)
 public final class PregenGameTests {
+    @GameTest(template = "empty", timeoutTicks = 200)
+    public static void pendingSaveNbtIsIsolated(GameTestHelper helper) throws Exception {
+        Path directory = Files.createTempDirectory("t2me-io-isolation-");
+        try (TestIOWorker worker = new TestIOWorker(directory)) {
+            @SuppressWarnings("unchecked")
+            ProcessorMailbox<StrictQueue.IntRunnable> mailbox =
+                    (ProcessorMailbox<StrictQueue.IntRunnable>) ObfuscationReflectionHelper
+                            .findField(IOWorker.class, "f_63517_").get(worker);
+            CountDownLatch entered = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            mailbox.tell(new StrictQueue.IntRunnable(0, () -> {
+                entered.countDown();
+                try {
+                    if (!release.await(10, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("test I/O gate timed out");
+                    }
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(error);
+                }
+            }));
+            helper.assertTrue(entered.await(10, TimeUnit.SECONDS), "I/O gate did not start");
+            CompoundTag saved = new CompoundTag();
+            saved.putString("Status", "minecraft:full");
+            CompoundTag nested = new CompoundTag();
+            nested.putInt("value", 42);
+            saved.put("nested", nested);
+            ChunkPos position = new ChunkPos(0, 0);
+            // Both foreground requests are queued before either runs. The load
+            // must see PendingStore.data, before the lower-priority disk write.
+            var stored = worker.store(position, saved);
+            var loadedFuture = worker.loadAsync(position);
+            release.countDown();
+            CompoundTag loaded = loadedFuture.get(10, TimeUnit.SECONDS).orElseThrow();
+            // This assertion deterministically fails against unpatched 1.20.1.
+            helper.assertTrue(loaded != saved, "pending save NBT escaped to the reader");
+            loaded.putString("__context", "reader mutation");
+            loaded.getCompound("nested").putInt("value", 9);
+            helper.assertTrue(!saved.contains("__context"), "reader changed pending save root");
+            helper.assertTrue(nested.getInt("value") == 42, "reader changed pending save child");
+            stored.get(10, TimeUnit.SECONDS);
+            worker.synchronize(true).get(10, TimeUnit.SECONDS);
+            CompoundTag disk = worker.loadAsync(position).get(10, TimeUnit.SECONDS).orElseThrow();
+            helper.assertTrue(!disk.contains("__context"), "reader mutation reached disk");
+            helper.assertTrue(disk.getCompound("nested").getInt("value") == 42,
+                    "reader child mutation reached disk");
+        } finally {
+            try (var files = Files.walk(directory)) {
+                for (Path file : files.sorted(Comparator.reverseOrder()).toList()) {
+                    Files.delete(file);
+                }
+            }
+        }
+        helper.succeed();
+    }
+
+    private static final class TestIOWorker extends IOWorker {
+        private TestIOWorker(Path directory) {
+            super(directory, true, "t2me-regression");
+        }
+    }
+
     @GameTest(template = "empty", timeoutTicks = 120_000)
     public static void generationAndLifecycle(GameTestHelper helper) {
         MinecraftServer server = helper.getLevel().getServer();
