@@ -27,13 +27,14 @@ responsiveness**.
 
 ## Highlights
 
-- Center-out pregeneration in `circle` or `square` regions.
+- Circle or square pregeneration, grouping new jobs by region with Hilbert
+  traversal inside each region to improve storage and generation locality.
 - Spawn-centered jobs or explicit dimension and block coordinates.
 - A bounded pipeline of vanilla/Forge `FULL` chunk futures.
 - Adaptive admission that ramps up on healthy ticks and backs off on tick-time
   or heap pressure, with additional protection while players are online.
-- Constant-time square planning and circle planning proportional to chunk rows,
-  with allocation-free sequential traversal.
+- Precomputed region counts and allocation-free sequential traversal.
+- Existing jobs retain their original spiral order and resume cursor.
 - Persistent cursor, progress, failures, retry attempts, and pending coordinates.
 - Safe clean-restart recovery with an optional 10-second auto-resume delay.
 - Pause, resume, cancel, status, metrics, CPS, and ETA commands.
@@ -139,8 +140,8 @@ saved values when upgrading.
 
 | Key | Default | Range | Effect |
 | --- | ---: | ---: | --- |
-| `scheduler.maxInFlight` | `32` | `1–256` | Ceiling for the adaptive number of simultaneous `FULL` requests. |
-| `scheduler.maxDispatchPerTick` | `16` | `1–256` | Maximum new requests admitted at the end of one tick. |
+| `scheduler.maxInFlight` | `64` | `1–256` | Ceiling for the adaptive number of simultaneous `FULL` requests. |
+| `scheduler.maxDispatchPerTick` | `32` | `1–256` | Maximum new requests admitted at the end of one tick. |
 | `scheduler.targetTickMillis` | `45` | `20–100` | Reduce admission when the latest tick or tick EWMA reaches this value. |
 | `scheduler.hardStopTickMillis` | `55` | `30–200` | Stop new admission immediately on a latest-tick or EWMA breach; wait for sustained recovery. |
 | `scheduler.minHeapHeadroomMiB` | `1024` | `256–8192` | Heap reserve, capped at 25% of maximum heap so small heaps remain usable. |
@@ -199,10 +200,11 @@ hardware, JVM, and server-health target.
 See the [feature-by-feature comparison](docs/COMPARISON.md) for the practical
 differences and guidance on choosing a setup.
 
-The [reproducible planner benchmark](benchmarks/README.md) compares planning
-overhead with T2ME's original algorithm. It checks matching counts and ordered
-sequence hashes. World-generation throughput still requires a controlled server
-benchmark; a faster planner alone cannot establish a winner against Chunky.
+The [reproducible planner benchmark](benchmarks/README.md) compares the retained
+spiral planner with its original algorithm. It checks matching counts and
+ordered sequence hashes. New jobs use region order; world-generation throughput
+requires a controlled server benchmark, and a faster planner alone cannot
+establish a winner against Chunky.
 Use the [server comparison harness](docs/BENCHMARKING.md) to measure matching
 regions on copies of a prepared world and verify that every target chunk is
 saved at `FULL` status.
@@ -217,8 +219,10 @@ saved at `FULL` status.
   optimization patches.
 - Previously generated chunks are still requested at `FULL`; they normally
   complete quickly but count toward progress.
-- Planning runs on the command thread, using at most 2,501 chunk rows for a
-  circle and constant-time counting for a square at the 20,000-block radius cap.
+- Planning runs on the command thread and precomputes region counts without
+  scanning every target chunk.
+- Older binaries cannot read region-order checkpoints. Use a pre-upgrade world
+  backup for downgrades. Upgrading existing spiral jobs preserves their order.
 - Recovery depends on normal Forge world saving. Keep external world backups;
   no mod can protect data from every crash, disk, hardware, or third-party
   failure.
@@ -243,7 +247,7 @@ cd T2ME
 
 The reobfuscated production JAR is written to `build/libs/`.
 
-The unit suite covers deterministic spiral traversal, exact shape boundaries,
+The unit suite covers deterministic region and spiral traversal, exact shape boundaries,
 cursor restoration, checkpoint validation, coordinate limits, admission
 recovery, completion handoff, stale ticket identities, retry exhaustion, and
 restart requeue ordering.

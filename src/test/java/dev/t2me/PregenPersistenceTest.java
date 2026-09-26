@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -35,7 +36,8 @@ class PregenPersistenceTest {
 
     @Test
     void loadsLegacyCheckpointWithoutRetryHistory() {
-        PregenJob job = job();
+        PregenJob job = new PregenJob("minecraft:overworld", -17, 15, 32,
+                PregenShape.CIRCLE, ChunkOrder.SPIRAL);
         long packed = job.pollNext();
         UUID ticket = UUID.randomUUID();
         job.markInFlight(packed, 1L, ticket);
@@ -43,9 +45,11 @@ class PregenPersistenceTest {
         CompoundTag legacy = job.snapshot().save();
         legacy.remove("RetryCoordinates");
         legacy.remove("RetryCounts");
+        legacy.remove("Order");
 
         PregenJob restored = PregenJob.restore(PregenJob.Snapshot.load(legacy));
         assertEquals(job.id(), restored.id());
+        assertEquals(ChunkOrder.SPIRAL, restored.order());
         assertEquals(job.failures(), restored.failures());
         assertEquals(packed, restored.pollNext());
         assertTrue(restored.snapshot().retryCounts().isEmpty());
@@ -61,7 +65,7 @@ class PregenPersistenceTest {
         PregenJob.Snapshot snapshot = new PregenJob.Snapshot(original.id(), original.dimension(),
                 original.centerBlockX(), original.centerBlockZ(), original.radiusBlocks(),
                 original.shape(), original.cursor(), 0L, 1L, original.state(),
-                original.createdEpochMillis(), original.message(), pending, retries);
+                original.createdEpochMillis(), original.message(), pending, retries, original.order());
         pending.clear();
         retries.clear();
         assertEquals(List.of(packed), snapshot.pending());
@@ -171,7 +175,7 @@ class PregenPersistenceTest {
     @Test
     void savedDataPreservesCorruptJobVerbatimUntilExplicitClear() {
         CompoundTag corrupt = job().snapshot().save();
-        corrupt.putLong("Cursor", 42L);
+        corrupt.putLong("Cursor", Long.MAX_VALUE);
         CompoundTag root = new CompoundTag();
         root.put("Job", corrupt);
 
@@ -211,6 +215,143 @@ class PregenPersistenceTest {
         T2MEData restored = T2MEData.load(original.save(new CompoundTag()));
         assertEquals(snapshot, restored.snapshot().orElseThrow());
         assertTrue(restored.loadError().isEmpty());
+    }
+
+    @Test
+    void legacyConstructorsAndMissingOrderResumeTheExactSpiralSequence() {
+        for (PregenShape shape : PregenShape.values()) {
+            SpiralChunkPlan original = new SpiralChunkPlan(-17, 15, 96, shape);
+            List<Long> completed = new ArrayList<>();
+            for (int index = 0; index < 23; index++) {
+                completed.add(original.nextPacked());
+            }
+            long firstPending = original.nextPacked();
+            long secondPending = original.nextPacked();
+            long legacyCursor = original.cursor();
+            List<Long> expectedRemainder = new ArrayList<>(List.of(firstPending, secondPending));
+            while (original.hasNext()) {
+                expectedRemainder.add(original.nextPacked());
+            }
+
+            PregenJob.Snapshot legacy = new PregenJob.Snapshot(UUID.randomUUID(), "minecraft:overworld",
+                    -17, 15, 96, shape, legacyCursor, completed.size(), 0L,
+                    JobState.RUNNING, 1234L, "running", List.of(firstPending, secondPending));
+            PregenJob.Snapshot legacyWithRetries = new PregenJob.Snapshot(legacy.id(), legacy.dimension(),
+                    legacy.centerBlockX(), legacy.centerBlockZ(), legacy.radiusBlocks(), legacy.shape(),
+                    legacy.cursor(), legacy.completed(), 1L, legacy.state(), legacy.createdEpochMillis(),
+                    legacy.message(), legacy.pending(), Map.of(firstPending, 1));
+            assertEquals(ChunkOrder.SPIRAL, legacy.order());
+            assertEquals(ChunkOrder.SPIRAL, legacyWithRetries.order());
+            assertEquals(ChunkOrder.SPIRAL, PregenJob.restore(legacyWithRetries).order());
+
+            CompoundTag oldSave = legacy.save();
+            oldSave.remove("Order");
+            PregenJob restored = PregenJob.restore(PregenJob.Snapshot.load(oldSave));
+            assertEquals(ChunkOrder.SPIRAL, restored.order());
+            List<Long> resumed = finish(restored);
+            assertEquals(expectedRemainder, resumed, "legacy cursor must never be interpreted as region order");
+            completed.addAll(resumed);
+            assertEquals(restored.target(), new HashSet<>(completed).size());
+            assertEquals(restored.target(), restored.completed());
+            assertEquals(JobState.COMPLETED, restored.state());
+        }
+    }
+
+    @Test
+    void regionCheckpointsRetainOrderAcrossRepeatedRestartsAndRegionBoundaries() {
+        for (PregenShape shape : PregenShape.values()) {
+            ChunkPlan reference = ChunkOrder.REGION.createPlan(511, -1, 96, shape);
+            List<Long> expected = new ArrayList<>();
+            while (reference.hasNext()) {
+                expected.add(reference.nextPacked());
+            }
+            PregenJob current = new PregenJob("minecraft:overworld", 511, -1, 96, shape);
+            List<Long> visited = new ArrayList<>();
+            for (int index = 0; index < 11; index++) {
+                long packed = current.pollNext();
+                visited.add(packed);
+                succeed(current, packed);
+            }
+            long reserved = current.pollNext();
+            long outstanding = current.pollNext();
+            current.markInFlight(outstanding, 1L, UUID.randomUUID());
+            CompoundTag checkpoint = current.snapshot().save();
+            assertEquals("region", checkpoint.getString("Order"));
+            current = PregenJob.restore(PregenJob.Snapshot.load(checkpoint));
+            assertEquals(List.of(reserved, outstanding), current.snapshot().pending());
+
+            while (current.hasDispatchableWork()) {
+                assertEquals(ChunkOrder.REGION, current.order());
+                long packed = current.pollNext();
+                visited.add(packed);
+                succeed(current, packed);
+                if (visited.size() % 17 == 0) {
+                    current = PregenJob.restore(PregenJob.Snapshot.load(current.snapshot().save()));
+                }
+            }
+            assertEquals(expected, visited);
+            assertEquals(expected.size(), new HashSet<>(visited).size());
+            assertEquals(current.target(), current.completed());
+            assertEquals(JobState.COMPLETED, current.state());
+        }
+    }
+
+    @Test
+    void explicitSpiralOrderIsRetainedByNewCheckpointSerialization() {
+        PregenJob job = new PregenJob("minecraft:overworld", 0, 0, 32, PregenShape.SQUARE, ChunkOrder.SPIRAL);
+        long pending = job.pollNext();
+        CompoundTag saved = job.snapshot().save();
+        assertEquals("spiral", saved.getString("Order"));
+        PregenJob restored = PregenJob.restore(PregenJob.Snapshot.load(saved));
+        assertEquals(ChunkOrder.SPIRAL, restored.order());
+        assertEquals(pending, restored.pollNext());
+    }
+
+    @Test
+    void unknownOrWrongTypeOrderIsRejectedAndOriginalDataRetained() {
+        for (String order : List.of("unknown", "", "region-v2")) {
+            CompoundTag bad = job().snapshot().save();
+            bad.putString("Order", order);
+            assertThrows(IllegalArgumentException.class, () -> PregenJob.Snapshot.load(bad));
+            CompoundTag root = new CompoundTag();
+            root.put("Job", bad);
+            T2MEData data = T2MEData.load(root);
+            assertTrue(data.loadError().isPresent());
+            assertEquals(root, data.save(new CompoundTag()));
+        }
+        CompoundTag wrongType = job().snapshot().save();
+        wrongType.putInt("Order", 1);
+        assertThrows(IllegalArgumentException.class, () -> PregenJob.Snapshot.load(wrongType));
+    }
+
+    @Test
+    void pendingCoordinateValidationUsesTheSavedOrder() {
+        for (ChunkOrder order : ChunkOrder.values()) {
+            PregenJob job = new PregenJob("minecraft:overworld", 511, -1, 96, PregenShape.SQUARE, order);
+            job.pollNext();
+            CompoundTag valid = job.snapshot().save();
+            assertEquals(order, PregenJob.restore(PregenJob.Snapshot.load(valid)).order());
+            long unvisited = job.pollNext();
+            valid.putLongArray("Pending", new long[]{unvisited});
+            assertThrows(IllegalArgumentException.class, () -> PregenJob.Snapshot.load(valid));
+        }
+    }
+
+    private static List<Long> finish(PregenJob job) {
+        List<Long> visited = new ArrayList<>();
+        while (job.hasDispatchableWork()) {
+            long packed = job.pollNext();
+            visited.add(packed);
+            succeed(job, packed);
+        }
+        return visited;
+    }
+
+    private static void succeed(PregenJob job, long packed) {
+        UUID ticket = UUID.randomUUID();
+        job.markInFlight(packed, 1L, ticket);
+        assertEquals(PregenJob.Completion.SUCCESS,
+                job.complete(packed, ticket, true, "", 2, 2L));
     }
 
     private static PregenJob job() {

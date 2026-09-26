@@ -33,10 +33,10 @@ public final class T2MEConfig {
                         "Admission starts at four and grows while tick time and heap are healthy.",
                         "Futures use Minecraft's worker pool; this is not a thread count."
                 )
-                .defineInRange("maxInFlight", 32, 1, AdaptiveLimiter.MAX_PIPELINE_SIZE);
+                .defineInRange("maxInFlight", 64, 1, AdaptiveLimiter.MAX_PIPELINE_SIZE);
         MAX_DISPATCH_PER_TICK = builder
                 .comment("Maximum new requests issued at the end of one server tick.")
-                .defineInRange("maxDispatchPerTick", 16, 1, AdaptiveLimiter.MAX_PIPELINE_SIZE);
+                .defineInRange("maxDispatchPerTick", 32, 1, AdaptiveLimiter.MAX_PIPELINE_SIZE);
         TARGET_TICK_MILLIS = builder
                 .comment(
                         "Admission is reduced when the latest tick or tick EWMA reaches this value.",

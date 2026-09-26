@@ -9,12 +9,14 @@ All notable changes to T2ME are documented here. The project follows
 
 ### Changed
 
+- Schedule new jobs by region with Hilbert traversal inside each region for
+  better locality. Persist traversal order and preserve legacy spiral cursors.
 - Count square plans in constant time and circle plans by chunk row instead of
   scanning the entire area. Preserve the original traversal and saved cursors.
 - Traverse with cached lookahead and incremental coordinates, removing repeated
   square roots and coordinate allocations from the sequential path.
 - Adapt the in-flight window gradually up to the configured limit. Defaults are
-  32 in flight and 16 admissions per tick, with an absolute bound of 256.
+  64 in flight and 32 admissions per tick, with an absolute bound of 256.
 - Back off immediately after a slow tick; require sustained recovery before
   restarting at no more than the previous startup-sized window. Heap pressure
   restarts at one request. Scale heap reserve for small JVM heaps and retain
@@ -38,6 +40,8 @@ All notable changes to T2ME are documented here. The project follows
   allow an operator pause to suppress pending automatic resume.
 - Recognize a fully completed recovered checkpoint without waiting for another
   callback.
+- Calculate startup and post-resume rates from observed elapsed time instead
+  of dividing a few seconds of progress by a full minute.
 
 ### Validation
 

@@ -9,7 +9,7 @@ import java.util.NoSuchElementException;
  * <p>The cursor counts inspected candidates, not accepted chunks. That makes a
  * single long sufficient to resume the exact traversal after a restart.</p>
  */
-public final class SpiralChunkPlan {
+public final class SpiralChunkPlan implements ChunkPlan {
     private static final int CHUNK_SIZE = 16;
     static final int MAX_RADIUS_BLOCKS = 20_000;
     static final int MAX_ABSOLUTE_BLOCK_COORDINATE = 29_999_984;
@@ -229,7 +229,7 @@ public final class SpiralChunkPlan {
     }
 
     /** Whether an accepted chunk occurs before the persisted candidate cursor. */
-    boolean wasVisited(long packed, long cursor) {
+    public boolean wasVisited(long packed, long cursor) {
         validateCursor(cursor);
         if (!contains(packed)) {
             return false;
@@ -258,7 +258,7 @@ public final class SpiralChunkPlan {
      * Counts accepted candidates before a checkpoint in O(chunk rows), without
      * enumerating the region or changing traversal state.
      */
-    long acceptedBefore(long cursor) {
+    public long acceptedBefore(long cursor) {
         validateCursor(cursor);
         if (cursor == 0L) {
             return 0L;

@@ -11,6 +11,19 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class PregenJobTest {
     @Test
+    void newJobsUseRegionOrderAndExplicitSpiralJobsRemainAvailable() {
+        PregenJob region = new PregenJob("minecraft:overworld", 511, -1, 96, PregenShape.SQUARE);
+        PregenJob spiral = new PregenJob("minecraft:overworld", 511, -1, 96,
+                PregenShape.SQUARE, ChunkOrder.SPIRAL);
+        assertEquals(ChunkOrder.REGION, region.order());
+        assertEquals(ChunkOrder.REGION, region.snapshot().order());
+        assertEquals(ChunkOrder.SPIRAL, spiral.order());
+        assertEquals(spiral.target(), region.target());
+        assertInstanceOf(RegionChunkPlan.class, ChunkOrder.REGION.createPlan(511, -1, 96, PregenShape.SQUARE));
+        assertInstanceOf(SpiralChunkPlan.class, ChunkOrder.SPIRAL.createPlan(511, -1, 96, PregenShape.SQUARE));
+    }
+
+    @Test
     void ignoresCompletionFromAStaleTicket() {
         PregenJob job = new PregenJob(
                 "minecraft:overworld",
@@ -243,27 +256,54 @@ class PregenJobTest {
     @Test
     void rollingRatesExpireAndDoNotLeakAcrossResume() {
         PregenJob job = squareJob();
-        succeed(job, job.pollNext(), 1_000_000_000L);
-        succeed(job, job.pollNext(), 2_000_000_000L);
-        assertEquals(0.4D, job.completionsPerSecond(5L, 2_000_000_000L));
-        assertEquals(0.2D, job.completionsPerSecond(5L, 6_100_000_000L));
-        assertEquals(0.0D, job.completionsPerSecond(60L, 62_100_000_000L));
+        long started = job.runStartedNanos();
+        succeed(job, job.pollNext(), started + 1_000_000_000L);
+        succeed(job, job.pollNext(), started + 2_000_000_000L);
+        assertEquals(1.0D, job.completionsPerSecond(5L, started + 2_000_000_000L));
+        assertEquals(0.2D, job.completionsPerSecond(5L, started + 6_100_000_000L));
+        assertEquals(0.0D, job.completionsPerSecond(60L, started + 62_100_000_000L));
 
-        succeed(job, job.pollNext(), 65_000_000_000L);
-        assertEquals(0.2D, job.completionsPerSecond(5L, 65_000_000_000L));
+        succeed(job, job.pollNext(), started + 65_000_000_000L);
+        assertEquals(0.2D, job.completionsPerSecond(5L, started + 65_000_000_000L));
         job.pause("pause");
         assertTrue(job.resume());
-        assertEquals(0.0D, job.completionsPerSecond(5L, 65_000_000_000L));
+        assertEquals(0.0D, job.completionsPerSecond(5L, job.runStartedNanos() + 1_000_000_000L));
         assertThrows(IllegalArgumentException.class, () -> job.completionsPerSecond(0L, 0L));
         assertThrows(IllegalArgumentException.class, () -> job.completionsPerSecond(61L, 0L));
     }
 
     @Test
-    void rollingRatesHandleNegativeNanoTimeOrigin() {
+    void rollingRatesKeepABoundedDenominatorBeforeTheRunStart() {
         PregenJob job = squareJob();
-        succeed(job, job.pollNext(), -2_000_000_000L);
-        assertEquals(0.2D, job.completionsPerSecond(5L, -1_000_000_000L));
-        assertEquals(0.0D, job.completionsPerSecond(5L, 3_100_000_000L));
+        long started = job.runStartedNanos();
+        succeed(job, job.pollNext(), started - 2_000_000_000L);
+        assertEquals(10.0D, job.completionsPerSecond(5L, started - 1_000_000_000L));
+        assertEquals(0.0D, job.completionsPerSecond(5L, started + 3_100_000_000L));
+    }
+
+    @Test
+    void startupRateUsesObservedTimeInsteadOfAnEntireMinute() {
+        PregenJob job = new PregenJob("minecraft:overworld", 0, 0, 128, PregenShape.SQUARE);
+        long started = job.runStartedNanos();
+        for (int index = 0; index < 80; index++) {
+            succeed(job, job.pollNext(), started + 8_000_000_000L);
+        }
+        assertEquals(10.0D, job.completionsPerSecond(60L, started + 8_000_000_000L));
+        assertEquals(16.0D, job.completionsPerSecond(5L, started + 8_000_000_000L));
+    }
+
+    @Test
+    void resumeRateStartsANewObservationWindowWithA100MillisecondFloor() {
+        PregenJob job = squareJob();
+        succeed(job, job.pollNext(), job.runStartedNanos() + 4_000_000_000L);
+        job.pause("pause");
+        assertTrue(job.resume());
+        long resumed = job.runStartedNanos();
+        assertEquals(0.0D, job.completionsPerSecond(60L, resumed));
+        succeed(job, job.pollNext(), resumed + 50_000_000L);
+        assertEquals(10.0D, job.completionsPerSecond(60L, resumed + 50_000_000L));
+        succeed(job, job.pollNext(), resumed + 2_000_000_000L);
+        assertEquals(1.0D, job.completionsPerSecond(60L, resumed + 2_000_000_000L));
     }
 
     @Test

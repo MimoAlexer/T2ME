@@ -24,7 +24,8 @@ public final class PregenJob {
 
     private final UUID id;
     private final String dimension;
-    private final SpiralChunkPlan plan;
+    private final ChunkPlan plan;
+    private final ChunkOrder order;
     private final long createdEpochMillis;
     private final ArrayDeque<Long> retryQueue = new ArrayDeque<>();
     private final Map<Long, Integer> retryCounts = new HashMap<>();
@@ -47,10 +48,22 @@ public final class PregenJob {
             int radiusBlocks,
             PregenShape shape
     ) {
+        this(dimension, centerBlockX, centerBlockZ, radiusBlocks, shape, ChunkOrder.REGION);
+    }
+
+    public PregenJob(
+            String dimension,
+            int centerBlockX,
+            int centerBlockZ,
+            int radiusBlocks,
+            PregenShape shape,
+            ChunkOrder order
+    ) {
         this(
                 UUID.randomUUID(),
                 dimension,
-                new SpiralChunkPlan(centerBlockX, centerBlockZ, radiusBlocks, shape),
+                Objects.requireNonNull(order, "order").createPlan(centerBlockX, centerBlockZ, radiusBlocks, shape),
+                order,
                 System.currentTimeMillis(),
                 JobState.RUNNING,
                 0L,
@@ -62,7 +75,8 @@ public final class PregenJob {
     private PregenJob(
             UUID id,
             String dimension,
-            SpiralChunkPlan plan,
+            ChunkPlan plan,
+            ChunkOrder order,
             long createdEpochMillis,
             JobState state,
             long completed,
@@ -75,6 +89,7 @@ public final class PregenJob {
         }
         this.dimension = dimension;
         this.plan = plan;
+        this.order = order;
         this.createdEpochMillis = createdEpochMillis;
         this.state = state;
         this.completed = completed;
@@ -85,7 +100,7 @@ public final class PregenJob {
 
     public static PregenJob restore(Snapshot snapshot) {
         Objects.requireNonNull(snapshot, "snapshot");
-        SpiralChunkPlan plan = new SpiralChunkPlan(
+        ChunkPlan plan = snapshot.order().createPlan(
                 snapshot.centerBlockX(),
                 snapshot.centerBlockZ(),
                 snapshot.radiusBlocks(),
@@ -97,6 +112,7 @@ public final class PregenJob {
                 snapshot.id(),
                 snapshot.dimension(),
                 plan,
+                snapshot.order(),
                 snapshot.createdEpochMillis(),
                 snapshot.state(),
                 snapshot.completed(),
@@ -274,7 +290,9 @@ public final class PregenJob {
                 count += completionCounts[index];
             }
         }
-        return count / (double) windowSeconds;
+        double observedSeconds = Math.max(RATE_BUCKET_NANOS, nowNanos - runStartedNanos)
+                / (double) ONE_SECOND_NANOS;
+        return count / Math.min(windowSeconds, observedSeconds);
     }
 
     public Snapshot snapshot() {
@@ -295,7 +313,8 @@ public final class PregenJob {
                 createdEpochMillis,
                 message,
                 pending,
-                retryCounts
+                retryCounts,
+                order
         );
     }
 
@@ -321,6 +340,10 @@ public final class PregenJob {
 
     public PregenShape shape() {
         return plan.shape();
+    }
+
+    public ChunkOrder order() {
+        return order;
     }
 
     public long target() {
@@ -369,7 +392,7 @@ public final class PregenJob {
         completionCounts[index]++;
     }
 
-    private static void validateSnapshot(Snapshot snapshot, SpiralChunkPlan plan) {
+    private static void validateSnapshot(Snapshot snapshot, ChunkPlan plan) {
         long visited = plan.acceptedBefore(snapshot.cursor());
         if (snapshot.completed() > plan.targetCount() || snapshot.completed() > visited) {
             throw new IllegalArgumentException("completed count exceeds target or visited chunks");
@@ -430,13 +453,15 @@ public final class PregenJob {
             long createdEpochMillis,
             String message,
             List<Long> pending,
-            Map<Long, Integer> retryCounts
+            Map<Long, Integer> retryCounts,
+            ChunkOrder order
     ) {
         public Snapshot {
             Objects.requireNonNull(id, "id");
             Objects.requireNonNull(shape, "shape");
             Objects.requireNonNull(state, "state");
             Objects.requireNonNull(message, "message");
+            Objects.requireNonNull(order, "order");
             if (dimension == null || dimension.isBlank() || ResourceLocation.tryParse(dimension) == null) {
                 throw new IllegalArgumentException("invalid dimension: " + dimension);
             }
@@ -458,7 +483,24 @@ public final class PregenJob {
                         long failures, JobState state, long createdEpochMillis,
                         String message, List<Long> pending) {
             this(id, dimension, centerBlockX, centerBlockZ, radiusBlocks, shape, cursor,
-                    completed, failures, state, createdEpochMillis, message, pending, Map.of());
+                    completed, failures, state, createdEpochMillis, message, pending, Map.of(), ChunkOrder.SPIRAL);
+        }
+
+        /** Checkpoints constructed without an order retain the original spiral cursor meaning. */
+        public Snapshot(UUID id, String dimension, int centerBlockX, int centerBlockZ,
+                        int radiusBlocks, PregenShape shape, long cursor, long completed,
+                        long failures, JobState state, long createdEpochMillis,
+                        String message, List<Long> pending, Map<Long, Integer> retryCounts) {
+            this(id, dimension, centerBlockX, centerBlockZ, radiusBlocks, shape, cursor,
+                    completed, failures, state, createdEpochMillis, message, pending, retryCounts, ChunkOrder.SPIRAL);
+        }
+
+        public Snapshot(UUID id, String dimension, int centerBlockX, int centerBlockZ,
+                        int radiusBlocks, PregenShape shape, long cursor, long completed,
+                        long failures, JobState state, long createdEpochMillis,
+                        String message, List<Long> pending, ChunkOrder order) {
+            this(id, dimension, centerBlockX, centerBlockZ, radiusBlocks, shape, cursor,
+                    completed, failures, state, createdEpochMillis, message, pending, Map.of(), order);
         }
 
         public CompoundTag save() {
@@ -469,6 +511,7 @@ public final class PregenJob {
             tag.putInt("CenterBlockZ", centerBlockZ);
             tag.putInt("RadiusBlocks", radiusBlocks);
             tag.putString("Shape", shape.name());
+            tag.putString("Order", order.serializedName());
             tag.putLong("Cursor", cursor);
             tag.putLong("Completed", completed);
             tag.putLong("Failures", failures);
@@ -481,8 +524,7 @@ public final class PregenJob {
             }
             tag.putLongArray("Pending", pendingArray);
             if (!retryCounts.isEmpty()) {
-                // The original fields and cursor retain their 0.1 meaning. Older versions
-                // can still read this checkpoint, ignoring the optional retry history.
+                // Retry history is optional; Order always determines the cursor's meaning.
                 long[] retryCoordinates = new long[retryCounts.size()];
                 int[] retryAttempts = new int[retryCounts.size()];
                 int index = 0;
@@ -518,6 +560,11 @@ public final class PregenJob {
             requireTag(tag, "CreatedEpochMillis", Tag.TAG_LONG);
             requireTag(tag, "Message", Tag.TAG_STRING);
             requireTag(tag, "Pending", Tag.TAG_LONG_ARRAY);
+            ChunkOrder order = ChunkOrder.SPIRAL;
+            if (tag.contains("Order")) {
+                requireTag(tag, "Order", Tag.TAG_STRING);
+                order = ChunkOrder.parse(tag.getString("Order"));
+            }
             long[] pendingArray = tag.getLongArray("Pending");
             List<Long> pending = new ArrayList<>(pendingArray.length);
             for (long packed : pendingArray) {
@@ -552,9 +599,10 @@ public final class PregenJob {
                     tag.getLong("CreatedEpochMillis"),
                     tag.getString("Message"),
                     pending,
-                    retryCounts
+                    retryCounts,
+                    order
             );
-            validateSnapshot(snapshot, new SpiralChunkPlan(snapshot.centerBlockX(),
+            validateSnapshot(snapshot, order.createPlan(snapshot.centerBlockX(),
                     snapshot.centerBlockZ(), snapshot.radiusBlocks(), snapshot.shape()));
             return snapshot;
         }

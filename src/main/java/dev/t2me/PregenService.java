@@ -325,7 +325,7 @@ public final class PregenService {
 
         return String.format(
                 Locale.ROOT,
-                "T2ME job=%s state=%s dim=%s center=%d,%d radius=%d shape=%s "
+                "T2ME job=%s state=%s dim=%s center=%d,%d radius=%d shape=%s order=%s "
                         + "done=%d/%d (%.2f%%) inFlight=%d retryQueue=%d failures=%d "
                         + "cps5=%.2f cps60=%.2f eta=%s throttle=%s message=%s",
                 job.id(),
@@ -335,6 +335,7 @@ public final class PregenService {
                 job.centerBlockZ(),
                 job.radiusBlocks(),
                 job.shape().serializedName(),
+                job.order().serializedName(),
                 job.completed(),
                 job.target(),
                 percent,

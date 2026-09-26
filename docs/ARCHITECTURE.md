@@ -29,7 +29,9 @@ pipeline, the region-file layer, or an engine optimization mod.
 | `T2MECommands` | Defines permission-gated operator commands and validates their arguments. |
 | `PregenService` | Owns the active job, tickets, request pipeline, lifecycle, metrics, and persistence boundaries. |
 | `PregenJob` | Tracks state, counters, retries, pending and in-flight coordinates, rates, and snapshots. |
-| `SpiralChunkPlan` | Deterministically enumerates chunks center-out and filters them against the requested block-space shape. |
+| `ChunkPlan` | Common traversal, cursor, shape, and checkpoint-validation contract. |
+| `RegionChunkPlan` | Groups new jobs by region and traverses each region with a Hilbert curve. |
+| `SpiralChunkPlan` | Preserves the original chunk spiral and shape geometry for legacy checkpoints. |
 | `AdaptiveLimiter` | Calculates the current request-admission limit. |
 | `CompletionMailbox` | Transfers immutable completion results to the server tick and discards late results after closure. |
 | `CompatibilityGuard` | Detects known competing pregenerators and invasive threading mods. |
@@ -122,9 +124,16 @@ generation algorithm change.
 
 ## Planning model
 
-`SpiralChunkPlan` enumerates a deterministic square spiral centered on the
-chunk containing the requested block coordinate. A cursor counts inspected
-candidates. This makes the traversal resumable with a single `long`.
+New jobs use `RegionChunkPlan`: regions are ordered outward from the center
+region, and chunks within each region follow a 32-by-32 Hilbert curve. Grouping
+nearby requests improves locality in Minecraft's generation graph and region
+storage. Local Hilbert coordinates are precomputed once. Neither chunk geometry
+nor terrain generation changes.
+
+Legacy jobs use `SpiralChunkPlan`, a deterministic square spiral centered on
+the chunk containing the requested block coordinate. Each plan has its own
+candidate cursor. The persisted `Order` field selects the matching plan;
+checkpoints without that field always use the legacy spiral.
 
 - `square` accepts any chunk whose block bounds overlap the requested square.
 - `circle` accepts any chunk whose block bounds intersect the requested
@@ -134,18 +143,27 @@ Consequently, boundary chunks are included even when only part of the chunk
 lies inside the requested shape. This is deliberate: it avoids gaps at the
 edge.
 
-Square target counting is constant time. Circle construction calculates an
+The shared geometry counts square targets in constant time. Circle geometry calculates an
 inclusive X interval for each chunk row using the nearest block Z and an exact
 integer square root. Construction and storage are proportional to the row
 count, with at most 2,501 rows under the 20,000-block radius limit. Membership
 checks then use those intervals in constant time.
 
-Sequential traversal increments integer coordinates without allocating a
-coordinate object or calculating a square root for every candidate. Lookahead
-caches the next accepted chunk without changing the persisted cursor. Cursor
-restoration and shape semantics remain compatible with 0.1 checkpoints.
-Checkpoint coverage can be counted from the completed inner square and partial
-outer ring in time proportional to chunk rows, without scanning the region.
+The region plan stores accepted counts for each intersecting region and prefix
+totals, without enumerating every target chunk. At the radius limit its primitive
+arrays need about 150 KiB plus shared Hilbert tables. Restoration combines complete
+region totals with at most one partial Hilbert region. Sequential traversal
+allocates no coordinate objects. Both planners cache lookahead without changing
+the persisted cursor, and both validate exact visited/pending checkpoint coverage.
+
+The retained spiral increments coordinates without per-candidate square roots.
+Its checkpoint coverage uses completed rings and row intervals. Existing 0.1
+and earlier spiral checkpoints therefore resume at exactly their original
+positions. Unknown or malformed orders are rejected and retained for inspection.
+
+Old binaries do not understand region cursors. Use a pre-upgrade world backup
+when downgrading; completing or cancelling a job still leaves its checkpoint
+on disk. New binaries can continue old spiral checkpoints without conversion.
 
 Command input is limited to a radius of 16–20,000 blocks, and the entire region
 must remain inside `±29,999,984` block coordinates. See the
@@ -159,7 +177,7 @@ exponentially weighted moving average with an alpha of `0.08`. The measurement
 includes completion handling and the previous tick's admission, snapshot and
 logging work, so scheduler overhead contributes to backpressure. A new job starts
 with a request window of four, or its configured ceiling if lower. The default
-ceiling is 32 and the absolute ceiling is 256. This is a count of futures;
+ceiling is 64 and the absolute ceiling is 256. This is a count of futures;
 Minecraft owns worker allocation, so processor count does not cap the window.
 
 Admission is adjusted in this order:
@@ -229,7 +247,8 @@ The snapshot contains:
 - job UUID and state;
 - dimension, center, radius, and shape;
 - traversal cursor and completion/failure counts;
-- creation time and current message; and
+- creation time and current message;
+- traversal order (`region` for new jobs, `spiral` for legacy checkpoints);
 - pending coordinates and their retry attempts, including requests that were
   in flight or polled for dispatch when a normal server stop began.
 
@@ -256,7 +275,9 @@ A job that was manually paused or paused by stall/failure handling remains
 paused across restart. It does not auto-resume.
 
 Completion metrics use fixed-size time buckets rather than retaining an object
-for every completion. Successful requests release their retry history. Snapshot
+for every completion. During startup or after resume, the rate denominator is
+the smaller of elapsed run time and the requested window, with a 100 ms floor.
+Successful requests release their retry history. Snapshot
 cost is proportional to current pending work rather than completed world area.
 
 Persistence reduces duplicate or skipped work after a clean restart; it is not
@@ -304,8 +325,8 @@ Changes should preserve all of these invariants:
 
 - One persisted job is supported at a time.
 - Only loaded dimensions can be targeted.
-- Shape planning happens on the command thread, using constant-time square
-  counting or at most 2,501 circle rows.
+- Shape planning happens on the command thread and uses chunk-row geometry plus
+  region prefix counts, without scanning every selected chunk.
 - There is no chunk trimming, deletion, selection import/export, or
   world-border integration.
 - T2ME does not benchmark, tune, or replace third-party terrain generators.
