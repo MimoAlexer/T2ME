@@ -2,9 +2,12 @@ package dev.t2me;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.*;
 
 class PregenJobTest {
     @Test
@@ -93,5 +96,195 @@ class PregenJobTest {
         assertEquals(2, job.retryQueueSize());
         assertEquals(first, job.pollNext());
         assertEquals(second, job.pollNext());
+    }
+
+    @Test
+    void snapshotIncludesPolledCoordinatesEvenBeforeTicketCreation() {
+        PregenJob job = squareJob();
+        long first = job.pollNext();
+        long second = job.pollNext();
+        UUID ticket = UUID.randomUUID();
+        job.markInFlight(second, 1L, ticket);
+        assertEquals(PregenJob.Completion.SUCCESS,
+                job.complete(second, ticket, true, "", 2, 2L));
+
+        PregenJob restored = PregenJob.restore(job.snapshot());
+        assertEquals(List.of(first), restored.snapshot().pending());
+        Set<Long> visited = new HashSet<>();
+        visited.add(second);
+        while (restored.hasDispatchableWork()) {
+            long packed = restored.pollNext();
+            assertTrue(visited.add(packed), "checkpoint must not redispatch completed chunks");
+            succeed(restored, packed, 3L);
+        }
+        assertEquals(restored.target(), visited.size());
+        assertEquals(restored.target(), restored.completed());
+        assertEquals(JobState.COMPLETED, restored.state());
+    }
+
+    @Test
+    void requeuesCoordinatesWhoseTicketCreationDidNotFinish() {
+        PregenJob job = squareJob();
+        long packed = job.pollNext();
+        job.requeueAllInFlight();
+        job.requeueAllInFlight();
+        assertEquals(List.of(packed), job.snapshot().pending());
+        assertEquals(packed, job.pollNext());
+        succeed(job, packed, 2L);
+        assertEquals(1L, job.completed());
+    }
+
+    @Test
+    void retryBudgetSurvivesCheckpointRestore() {
+        PregenJob job = squareJob();
+        long packed = job.pollNext();
+        UUID first = UUID.randomUUID();
+        job.markInFlight(packed, 1L, first);
+        assertEquals(PregenJob.Completion.RETRY,
+                job.complete(packed, first, false, "first failure", 1, 2L));
+
+        PregenJob restored = PregenJob.restore(job.snapshot());
+        assertEquals(packed, restored.pollNext());
+        UUID second = UUID.randomUUID();
+        restored.markInFlight(packed, 3L, second);
+        assertEquals(PregenJob.Completion.PAUSED,
+                restored.complete(packed, second, false, "second failure", 1, 4L));
+        assertEquals(2L, restored.failures());
+        assertEquals(List.of(packed), restored.snapshot().pending());
+        assertTrue(restored.resume());
+        assertEquals(packed, restored.pollNext());
+        succeed(restored, packed, 5L);
+        assertEquals(1L, restored.completed());
+        assertTrue(restored.snapshot().retryCounts().isEmpty());
+    }
+
+    @Test
+    void staleTicketCannotCompleteAReissuedCoordinate() {
+        PregenJob job = squareJob();
+        long packed = job.pollNext();
+        UUID oldTicket = UUID.randomUUID();
+        job.markInFlight(packed, 1L, oldTicket);
+        job.requeueAllInFlight();
+        assertEquals(packed, job.pollNext());
+        UUID newTicket = UUID.randomUUID();
+        job.markInFlight(packed, 2L, newTicket);
+
+        assertEquals(PregenJob.Completion.IGNORED,
+                job.complete(packed, oldTicket, true, "", 2, 3L));
+        assertEquals(0L, job.completed());
+        assertEquals(1, job.inFlightCount());
+        assertEquals(PregenJob.Completion.SUCCESS,
+                job.complete(packed, newTicket, true, "", 2, 4L));
+    }
+
+    @Test
+    void terminalJobsCannotBeResurrectedByCallbacks() {
+        for (boolean cancelled : List.of(true, false)) {
+            PregenJob job = new PregenJob("minecraft:overworld", 0, 0, 0, PregenShape.SQUARE);
+            long packed = job.pollNext();
+            UUID ticket = UUID.randomUUID();
+            job.markInFlight(packed, 1L, ticket);
+            if (cancelled) {
+                job.cancel();
+            } else {
+                job.fail("dimension unavailable");
+            }
+            JobState expected = cancelled ? JobState.CANCELLED : JobState.FAILED;
+            assertEquals(PregenJob.Completion.IGNORED,
+                    job.complete(packed, ticket, true, "", 2, 2L));
+            assertEquals(expected, job.state());
+            assertEquals(0L, job.completed());
+            assertFalse(job.resume());
+            assertThrows(IllegalStateException.class, job::pollNext);
+            assertEquals(expected, PregenJob.restore(job.snapshot()).state());
+        }
+    }
+
+    @Test
+    void finalCompletionIsCountedExactlyOnce() {
+        PregenJob job = new PregenJob("minecraft:overworld", -1, -1, 0, PregenShape.CIRCLE);
+        long packed = job.pollNext();
+        UUID ticket = UUID.randomUUID();
+        job.markInFlight(packed, 1L, ticket);
+        assertEquals(PregenJob.Completion.SUCCESS,
+                job.complete(packed, ticket, true, "", 0, 2L));
+        assertEquals(PregenJob.Completion.IGNORED,
+                job.complete(packed, ticket, true, "", 0, 3L));
+        assertEquals(JobState.COMPLETED, job.state());
+        assertEquals(1L, job.completed());
+        assertFalse(job.hasDispatchableWork());
+    }
+
+    @Test
+    void backgroundFailureDoesNotOverwriteOperatorPauseReason() {
+        PregenJob job = squareJob();
+        long packed = job.pollNext();
+        UUID ticket = UUID.randomUUID();
+        job.markInFlight(packed, 1L, ticket);
+        job.pause("paused by operator");
+        assertEquals(PregenJob.Completion.RETRY,
+                job.complete(packed, ticket, false, "temporary failure", 2, 2L));
+        assertEquals(JobState.PAUSED, job.state());
+        assertEquals("paused by operator", job.message());
+    }
+
+    @Test
+    void invalidRetryLimitDoesNotLoseAnOutstandingChunk() {
+        PregenJob job = squareJob();
+        long packed = job.pollNext();
+        UUID ticket = UUID.randomUUID();
+        job.markInFlight(packed, 1L, ticket);
+        assertThrows(IllegalArgumentException.class,
+                () -> job.complete(packed, ticket, false, "failure", -1, 2L));
+        assertEquals(1, job.inFlightCount());
+        assertEquals(List.of(packed), job.snapshot().pending());
+    }
+
+    @Test
+    void rollingRatesExpireAndDoNotLeakAcrossResume() {
+        PregenJob job = squareJob();
+        succeed(job, job.pollNext(), 1_000_000_000L);
+        succeed(job, job.pollNext(), 2_000_000_000L);
+        assertEquals(0.4D, job.completionsPerSecond(5L, 2_000_000_000L));
+        assertEquals(0.2D, job.completionsPerSecond(5L, 6_100_000_000L));
+        assertEquals(0.0D, job.completionsPerSecond(60L, 62_100_000_000L));
+
+        succeed(job, job.pollNext(), 65_000_000_000L);
+        assertEquals(0.2D, job.completionsPerSecond(5L, 65_000_000_000L));
+        job.pause("pause");
+        assertTrue(job.resume());
+        assertEquals(0.0D, job.completionsPerSecond(5L, 65_000_000_000L));
+        assertThrows(IllegalArgumentException.class, () -> job.completionsPerSecond(0L, 0L));
+        assertThrows(IllegalArgumentException.class, () -> job.completionsPerSecond(61L, 0L));
+    }
+
+    @Test
+    void rollingRatesHandleNegativeNanoTimeOrigin() {
+        PregenJob job = squareJob();
+        succeed(job, job.pollNext(), -2_000_000_000L);
+        assertEquals(0.2D, job.completionsPerSecond(5L, -1_000_000_000L));
+        assertEquals(0.0D, job.completionsPerSecond(5L, 3_100_000_000L));
+    }
+
+    @Test
+    void ticketValidationLeavesReservationRecoverable() {
+        PregenJob job = squareJob();
+        long packed = job.pollNext();
+        assertThrows(NullPointerException.class, () -> job.markInFlight(packed, 1L, null));
+        assertEquals(List.of(packed), job.snapshot().pending());
+        assertThrows(IllegalStateException.class,
+                () -> job.markInFlight(SpiralChunkPlan.pack(100, 100), 1L, UUID.randomUUID()));
+        succeed(job, packed, 2L);
+    }
+
+    private static PregenJob squareJob() {
+        return new PregenJob("minecraft:overworld", 0, 0, 32, PregenShape.SQUARE);
+    }
+
+    private static void succeed(PregenJob job, long packed, long nowNanos) {
+        UUID ticket = UUID.randomUUID();
+        job.markInFlight(packed, nowNanos, ticket);
+        assertEquals(PregenJob.Completion.SUCCESS,
+                job.complete(packed, ticket, true, "", 2, nowNanos));
     }
 }

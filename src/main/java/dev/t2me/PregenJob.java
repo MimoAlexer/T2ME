@@ -1,18 +1,26 @@
 package dev.t2me;
 
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.Tag;
+import net.minecraft.resources.ResourceLocation;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 
 public final class PregenJob {
     private static final long ONE_SECOND_NANOS = 1_000_000_000L;
+    private static final long RATE_BUCKET_NANOS = ONE_SECOND_NANOS / 10L;
+    private static final int RATE_BUCKET_COUNT = 601;
 
     private final UUID id;
     private final String dimension;
@@ -20,8 +28,11 @@ public final class PregenJob {
     private final long createdEpochMillis;
     private final ArrayDeque<Long> retryQueue = new ArrayDeque<>();
     private final Map<Long, Integer> retryCounts = new HashMap<>();
+    // A coordinate remains owned by the job even if ticket creation fails after polling.
+    private final Set<Long> dispatching = new LinkedHashSet<>();
     private final LinkedHashMap<Long, InFlight> inFlight = new LinkedHashMap<>();
-    private final ArrayDeque<Long> completionNanos = new ArrayDeque<>();
+    private final long[] completionBuckets = new long[RATE_BUCKET_COUNT];
+    private final long[] completionCounts = new long[RATE_BUCKET_COUNT];
 
     private JobState state;
     private long completed;
@@ -58,7 +69,10 @@ public final class PregenJob {
             long failures,
             String message
     ) {
-        this.id = id;
+        this.id = Objects.requireNonNull(id, "id");
+        if (dimension == null || dimension.isBlank() || ResourceLocation.tryParse(dimension) == null) {
+            throw new IllegalArgumentException("invalid dimension: " + dimension);
+        }
         this.dimension = dimension;
         this.plan = plan;
         this.createdEpochMillis = createdEpochMillis;
@@ -70,12 +84,14 @@ public final class PregenJob {
     }
 
     public static PregenJob restore(Snapshot snapshot) {
+        Objects.requireNonNull(snapshot, "snapshot");
         SpiralChunkPlan plan = new SpiralChunkPlan(
                 snapshot.centerBlockX(),
                 snapshot.centerBlockZ(),
                 snapshot.radiusBlocks(),
                 snapshot.shape()
         );
+        validateSnapshot(snapshot, plan);
         plan.cursor(snapshot.cursor());
         PregenJob job = new PregenJob(
                 snapshot.id(),
@@ -88,18 +104,29 @@ public final class PregenJob {
                 snapshot.message()
         );
         snapshot.pending().forEach(job.retryQueue::addLast);
+        job.retryCounts.putAll(snapshot.retryCounts());
+        if (!job.state.isTerminal() && job.completed == plan.targetCount()) {
+            job.state = JobState.COMPLETED;
+            job.message = "completed";
+        }
         return job;
     }
 
     public long pollNext() {
+        if (state.isTerminal()) {
+            throw new IllegalStateException("job is " + state);
+        }
         Long retry = retryQueue.pollFirst();
         if (retry != null) {
+            dispatching.add(retry);
             return retry;
         }
         if (!plan.hasNext()) {
             throw new NoSuchElementException("job exhausted");
         }
-        return plan.nextPacked();
+        long packed = plan.nextPacked();
+        dispatching.add(packed);
+        return packed;
     }
 
     public boolean hasDispatchableWork() {
@@ -107,9 +134,14 @@ public final class PregenJob {
     }
 
     public void markInFlight(long packed, long startedNanos, UUID ticketId) {
+        Objects.requireNonNull(ticketId, "ticketId");
+        if (!dispatching.contains(packed)) {
+            throw new IllegalStateException("chunk was not polled for dispatch: " + packed);
+        }
         if (inFlight.putIfAbsent(packed, new InFlight(startedNanos, ticketId)) != null) {
             throw new IllegalStateException("chunk already in flight: " + packed);
         }
+        dispatching.remove(packed);
     }
 
     public Completion complete(
@@ -120,18 +152,23 @@ public final class PregenJob {
             int maxRetries,
             long nowNanos
     ) {
+        if (state.isTerminal()) {
+            return Completion.IGNORED;
+        }
         InFlight current = inFlight.get(packed);
         if (current == null || !current.ticketId().equals(ticketId)) {
             return Completion.IGNORED;
+        }
+        if (maxRetries < 0) {
+            throw new IllegalArgumentException("maxRetries must be non-negative");
         }
         inFlight.remove(packed);
 
         if (successful) {
             completed++;
             retryCounts.remove(packed);
-            completionNanos.addLast(nowNanos);
-            pruneCompletionSamples(nowNanos);
-            if (!hasDispatchableWork() && inFlight.isEmpty()) {
+            recordCompletion(nowNanos);
+            if (completed == target() && dispatching.isEmpty() && inFlight.isEmpty()) {
                 state = JobState.COMPLETED;
                 message = "completed";
             }
@@ -142,13 +179,15 @@ public final class PregenJob {
         int retry = retryCounts.merge(packed, 1, Integer::sum);
         if (retry <= maxRetries) {
             retryQueue.addLast(packed);
-            message = "retry " + retry + "/" + maxRetries + " for "
-                    + coordinateText(packed) + ": " + error;
+            if (state == JobState.RUNNING) {
+                message = "retry " + retry + "/" + maxRetries + " for "
+                        + coordinateText(packed) + ": " + error;
+            }
             return Completion.RETRY;
         }
 
         state = JobState.PAUSED;
-        retryCounts.put(packed, 0);
+        retryCounts.remove(packed);
         retryQueue.addFirst(packed);
         message = "paused after " + retry + " failures at "
                 + coordinateText(packed) + ": " + error;
@@ -156,11 +195,13 @@ public final class PregenJob {
     }
 
     public void requeueAllInFlight() {
-        if (inFlight.isEmpty()) {
+        if (inFlight.isEmpty() && dispatching.isEmpty()) {
             return;
         }
         List<Long> pending = new ArrayList<>(inFlight.keySet());
+        pending.addAll(dispatching);
         inFlight.clear();
+        dispatching.clear();
         for (int index = pending.size() - 1; index >= 0; index--) {
             retryQueue.addFirst(pending.get(index));
         }
@@ -180,6 +221,7 @@ public final class PregenJob {
         state = JobState.RUNNING;
         message = "running";
         runStartedNanos = System.nanoTime();
+        java.util.Arrays.fill(completionCounts, 0L);
         return true;
     }
 
@@ -188,6 +230,7 @@ public final class PregenJob {
         message = "cancelled";
         retryQueue.clear();
         retryCounts.clear();
+        dispatching.clear();
         inFlight.clear();
     }
 
@@ -197,11 +240,9 @@ public final class PregenJob {
     }
 
     public long oldestInFlightAgeNanos(long nowNanos) {
-        long oldest = Long.MAX_VALUE;
-        for (InFlight flight : inFlight.values()) {
-            oldest = Math.min(oldest, flight.startedNanos());
-        }
-        return oldest == Long.MAX_VALUE ? 0L : Math.max(0L, nowNanos - oldest);
+        // Entries are issued on the server thread and retain admission order.
+        return inFlight.isEmpty() ? 0L
+                : Math.max(0L, nowNanos - inFlight.values().iterator().next().startedNanos());
     }
 
     public long oldestInFlightPacked() {
@@ -220,12 +261,17 @@ public final class PregenJob {
     }
 
     public double completionsPerSecond(long windowSeconds, long nowNanos) {
-        pruneCompletionSamples(nowNanos);
-        long cutoff = nowNanos - windowSeconds * ONE_SECOND_NANOS;
-        int count = 0;
-        for (long completion : completionNanos) {
-            if (completion >= cutoff) {
-                count++;
+        if (windowSeconds <= 0L || windowSeconds > 60L) {
+            throw new IllegalArgumentException("rate window must be between 1 and 60 seconds");
+        }
+        long currentBucket = Math.floorDiv(nowNanos, RATE_BUCKET_NANOS);
+        long cutoffBucket = currentBucket - windowSeconds * 10L;
+        long count = 0L;
+        // Fixed 100 ms buckets bound memory and query work even for existing chunks.
+        for (int index = 0; index < RATE_BUCKET_COUNT; index++) {
+            if (completionBuckets[index] >= cutoffBucket
+                    && completionBuckets[index] <= currentBucket) {
+                count += completionCounts[index];
             }
         }
         return count / (double) windowSeconds;
@@ -233,6 +279,7 @@ public final class PregenJob {
 
     public Snapshot snapshot() {
         List<Long> pending = new ArrayList<>(retryQueue);
+        pending.addAll(dispatching);
         pending.addAll(inFlight.keySet());
         return new Snapshot(
                 id,
@@ -247,7 +294,8 @@ public final class PregenJob {
                 state,
                 createdEpochMillis,
                 message,
-                pending
+                pending,
+                retryCounts
         );
     }
 
@@ -311,10 +359,43 @@ public final class PregenJob {
         return runStartedNanos;
     }
 
-    private void pruneCompletionSamples(long nowNanos) {
-        long cutoff = nowNanos - 60L * ONE_SECOND_NANOS;
-        while (!completionNanos.isEmpty() && completionNanos.peekFirst() < cutoff) {
-            completionNanos.removeFirst();
+    private void recordCompletion(long nowNanos) {
+        long bucket = Math.floorDiv(nowNanos, RATE_BUCKET_NANOS);
+        int index = Math.floorMod(bucket, RATE_BUCKET_COUNT);
+        if (completionBuckets[index] != bucket) {
+            completionBuckets[index] = bucket;
+            completionCounts[index] = 0L;
+        }
+        completionCounts[index]++;
+    }
+
+    private static void validateSnapshot(Snapshot snapshot, SpiralChunkPlan plan) {
+        long visited = plan.acceptedBefore(snapshot.cursor());
+        if (snapshot.completed() > plan.targetCount() || snapshot.completed() > visited) {
+            throw new IllegalArgumentException("completed count exceeds target or visited chunks");
+        }
+        Set<Long> pending = new HashSet<>();
+        for (long packed : snapshot.pending()) {
+            if (!pending.add(packed)) {
+                throw new IllegalArgumentException("duplicate pending chunk: " + coordinateText(packed));
+            }
+            if (!plan.wasVisited(packed, snapshot.cursor())) {
+                throw new IllegalArgumentException("pending chunk was not visited: " + coordinateText(packed));
+            }
+        }
+        // Cancellation intentionally drops remaining coordinates. Every other state must
+        // account for all visited chunks, otherwise resuming could silently leave holes.
+        if (snapshot.state() != JobState.CANCELLED
+                && snapshot.completed() + pending.size() != visited) {
+            throw new IllegalArgumentException("checkpoint loses visited chunks: completed="
+                    + snapshot.completed() + ", pending=" + pending.size() + ", visited=" + visited);
+        }
+        if (snapshot.state() == JobState.COMPLETED
+                && (snapshot.completed() != plan.targetCount() || !pending.isEmpty())) {
+            throw new IllegalArgumentException("completed job has unfinished chunks");
+        }
+        if (!pending.containsAll(snapshot.retryCounts().keySet())) {
+            throw new IllegalArgumentException("retry counts refer to non-pending chunks");
         }
     }
 
@@ -348,8 +429,38 @@ public final class PregenJob {
             JobState state,
             long createdEpochMillis,
             String message,
-            List<Long> pending
+            List<Long> pending,
+            Map<Long, Integer> retryCounts
     ) {
+        public Snapshot {
+            Objects.requireNonNull(id, "id");
+            Objects.requireNonNull(shape, "shape");
+            Objects.requireNonNull(state, "state");
+            Objects.requireNonNull(message, "message");
+            if (dimension == null || dimension.isBlank() || ResourceLocation.tryParse(dimension) == null) {
+                throw new IllegalArgumentException("invalid dimension: " + dimension);
+            }
+            if (cursor < 0L || completed < 0L || failures < 0L) {
+                throw new IllegalArgumentException("cursor and progress counters must be non-negative");
+            }
+            pending = List.copyOf(pending);
+            retryCounts = Map.copyOf(retryCounts);
+            for (int count : retryCounts.values()) {
+                if (count <= 0 || count == Integer.MAX_VALUE) {
+                    throw new IllegalArgumentException("invalid retry count: " + count);
+                }
+            }
+        }
+
+        /** Source compatibility for checkpoints created before retry persistence. */
+        public Snapshot(UUID id, String dimension, int centerBlockX, int centerBlockZ,
+                        int radiusBlocks, PregenShape shape, long cursor, long completed,
+                        long failures, JobState state, long createdEpochMillis,
+                        String message, List<Long> pending) {
+            this(id, dimension, centerBlockX, centerBlockZ, radiusBlocks, shape, cursor,
+                    completed, failures, state, createdEpochMillis, message, pending, Map.of());
+        }
+
         public CompoundTag save() {
             CompoundTag tag = new CompoundTag();
             tag.putUUID("Id", id);
@@ -369,17 +480,66 @@ public final class PregenJob {
                 pendingArray[index] = pending.get(index);
             }
             tag.putLongArray("Pending", pendingArray);
+            if (!retryCounts.isEmpty()) {
+                // The original fields and cursor retain their 0.1 meaning. Older versions
+                // can still read this checkpoint, ignoring the optional retry history.
+                long[] retryCoordinates = new long[retryCounts.size()];
+                int[] retryAttempts = new int[retryCounts.size()];
+                int index = 0;
+                for (long packed : pending) {
+                    Integer attempts = retryCounts.get(packed);
+                    if (attempts != null) {
+                        retryCoordinates[index] = packed;
+                        retryAttempts[index++] = attempts;
+                    }
+                }
+                if (index != retryCounts.size()) {
+                    throw new IllegalStateException("retry counts refer to non-pending chunks");
+                }
+                tag.putLongArray("RetryCoordinates", retryCoordinates);
+                tag.putIntArray("RetryCounts", retryAttempts);
+            }
             return tag;
         }
 
         public static Snapshot load(CompoundTag tag) {
+            if (!tag.hasUUID("Id")) {
+                throw new IllegalArgumentException("checkpoint has no valid Id");
+            }
+            requireTag(tag, "Dimension", Tag.TAG_STRING);
+            requireTag(tag, "CenterBlockX", Tag.TAG_INT);
+            requireTag(tag, "CenterBlockZ", Tag.TAG_INT);
+            requireTag(tag, "RadiusBlocks", Tag.TAG_INT);
+            requireTag(tag, "Shape", Tag.TAG_STRING);
+            requireTag(tag, "Cursor", Tag.TAG_LONG);
+            requireTag(tag, "Completed", Tag.TAG_LONG);
+            requireTag(tag, "Failures", Tag.TAG_LONG);
+            requireTag(tag, "State", Tag.TAG_STRING);
+            requireTag(tag, "CreatedEpochMillis", Tag.TAG_LONG);
+            requireTag(tag, "Message", Tag.TAG_STRING);
+            requireTag(tag, "Pending", Tag.TAG_LONG_ARRAY);
             long[] pendingArray = tag.getLongArray("Pending");
             List<Long> pending = new ArrayList<>(pendingArray.length);
             for (long packed : pendingArray) {
                 pending.add(packed);
             }
-            return new Snapshot(
-                    tag.hasUUID("Id") ? tag.getUUID("Id") : UUID.randomUUID(),
+            Map<Long, Integer> retryCounts = new HashMap<>();
+            if (tag.contains("RetryCoordinates") || tag.contains("RetryCounts")) {
+                requireTag(tag, "RetryCoordinates", Tag.TAG_LONG_ARRAY);
+                requireTag(tag, "RetryCounts", Tag.TAG_INT_ARRAY);
+                long[] coordinates = tag.getLongArray("RetryCoordinates");
+                int[] attempts = tag.getIntArray("RetryCounts");
+                if (coordinates.length != attempts.length) {
+                    throw new IllegalArgumentException("retry coordinates/counts have different lengths");
+                }
+                for (int index = 0; index < coordinates.length; index++) {
+                    if (retryCounts.putIfAbsent(coordinates[index], attempts[index]) != null) {
+                        throw new IllegalArgumentException("duplicate retry coordinate");
+                    }
+                }
+            }
+            Snapshot snapshot = new Snapshot(
+                    tag.getUUID("Id"),
                     tag.getString("Dimension"),
                     tag.getInt("CenterBlockX"),
                     tag.getInt("CenterBlockZ"),
@@ -391,8 +551,18 @@ public final class PregenJob {
                     JobState.valueOf(tag.getString("State")),
                     tag.getLong("CreatedEpochMillis"),
                     tag.getString("Message"),
-                    List.copyOf(pending)
+                    pending,
+                    retryCounts
             );
+            validateSnapshot(snapshot, new SpiralChunkPlan(snapshot.centerBlockX(),
+                    snapshot.centerBlockZ(), snapshot.radiusBlocks(), snapshot.shape()));
+            return snapshot;
+        }
+
+        private static void requireTag(CompoundTag tag, String key, int type) {
+            if (!tag.contains(key, type)) {
+                throw new IllegalArgumentException("checkpoint field missing or wrong type: " + key);
+            }
         }
     }
 }

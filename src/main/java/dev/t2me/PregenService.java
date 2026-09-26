@@ -45,14 +45,18 @@ public final class PregenService {
     private AdaptiveLimiter.Decision lastDecision =
             new AdaptiveLimiter.Decision(0, "not started", 0L);
     private long tickStartedNanos;
+    private long previousEndWorkNanos;
     private long tickCounter;
     private long autoResumeAtTick = Long.MAX_VALUE;
     private long lastProgressLogTick;
+    private CompletionMailbox<FinishedRequest> completions = new CompletionMailbox<>();
 
     private PregenService() {
     }
 
     public void attach(MinecraftServer server) {
+        completions.close();
+        completions = new CompletionMailbox<>();
         if (requestExecutor != null) {
             requestExecutor.shutdownNow();
         }
@@ -60,6 +64,11 @@ public final class PregenService {
         this.server = server;
         this.job = null;
         this.tickCounter = 0L;
+        this.tickStartedNanos = 0L;
+        this.previousEndWorkNanos = 0L;
+        this.lastProgressLogTick = 0L;
+        this.limiter.reset();
+        this.lastDecision = new AdaptiveLimiter.Decision(0, "warming up", 0L);
         this.autoResumeAtTick = Long.MAX_VALUE;
         this.compatibility = CompatibilityGuard.inspect();
         this.data = server.overworld().getDataStorage().computeIfAbsent(
@@ -97,6 +106,8 @@ public final class PregenService {
         if (server == null) {
             return;
         }
+        drainCompletions();
+        completions.close();
         if (job != null && !job.state().isTerminal()) {
             releaseAllTickets(job);
             job.requeueAllInFlight();
@@ -124,16 +135,22 @@ public final class PregenService {
         }
 
         long now = System.nanoTime();
+        drainCompletions();
+        long decisionStarted = System.nanoTime();
         if (tickStartedNanos != 0L) {
-            limiter.recordTick(now - tickStartedNanos);
+            // Include completion handling now and the previous tick's admission,
+            // snapshot and logging cost. Otherwise T2ME hides its own work from
+            // backpressure by measuring only the tick before this listener.
+            limiter.recordTick(decisionStarted - tickStartedNanos + previousEndWorkNanos);
         }
         tickCounter++;
-        lastDecision = limiter.decide(server);
+        lastDecision = limiter.decide(server, job != null && job.state() == JobState.RUNNING);
 
         if (job != null
                 && tickCounter >= autoResumeAtTick
                 && job.state() == JobState.PAUSED) {
             autoResumeAtTick = Long.MAX_VALUE;
+            compatibility = CompatibilityGuard.inspect();
             if (!compatibility.blocksStart() && job.resume()) {
                 T2ME.LOGGER.info("Auto-resumed T2ME job {}", job.id());
                 persist();
@@ -171,6 +188,7 @@ public final class PregenService {
             lastProgressLogTick = tickCounter;
             T2ME.LOGGER.info("{}", statusLine());
         }
+        previousEndWorkNanos = System.nanoTime() - decisionStarted;
     }
 
     public OperationResult start(
@@ -182,6 +200,10 @@ public final class PregenService {
     ) {
         if (server == null) {
             return OperationResult.failure("T2ME is not attached to a server");
+        }
+        if (data.loadError().isPresent()) {
+            return OperationResult.failure("saved job is invalid: " + data.loadError().get()
+                    + ". Inspect the save, then use /t2me pregen cancel to discard it explicitly.");
         }
         compatibility = CompatibilityGuard.inspect();
         if (compatibility.blocksStart()) {
@@ -212,6 +234,9 @@ public final class PregenService {
             return OperationResult.failure("could not create plan: " + rootMessage(error));
         }
         autoResumeAtTick = Long.MAX_VALUE;
+        completions.close();
+        completions = new CompletionMailbox<>();
+        limiter.resetAdmission();
         lastProgressLogTick = tickCounter;
         persist();
         T2ME.LOGGER.info(
@@ -228,8 +253,13 @@ public final class PregenService {
     }
 
     public OperationResult pause() {
+        autoResumeAtTick = Long.MAX_VALUE;
         if (job == null) {
             return OperationResult.failure("no T2ME job exists");
+        }
+        if (job.state() == JobState.PAUSED) {
+            persist();
+            return OperationResult.success(statusLine());
         }
         if (job.state() != JobState.RUNNING) {
             return OperationResult.failure("job is " + job.state().name().toLowerCase(Locale.ROOT));
@@ -240,6 +270,7 @@ public final class PregenService {
     }
 
     public OperationResult resume() {
+        autoResumeAtTick = Long.MAX_VALUE;
         if (job == null) {
             return OperationResult.failure("no T2ME job exists");
         }
@@ -255,6 +286,11 @@ public final class PregenService {
     }
 
     public OperationResult cancel() {
+        autoResumeAtTick = Long.MAX_VALUE;
+        if (data != null && data.loadError().isPresent()) {
+            data.clear();
+            return OperationResult.success("invalid saved job discarded; a new job can now be started");
+        }
         if (job == null) {
             return OperationResult.failure("no T2ME job exists");
         }
@@ -262,12 +298,17 @@ public final class PregenService {
             return OperationResult.failure("job is already " + job.state().name().toLowerCase(Locale.ROOT));
         }
         releaseAllTickets(job);
+        completions.close();
         job.cancel();
         persist();
         return OperationResult.success(statusLine());
     }
 
     public String statusLine() {
+        if (data != null && data.loadError().isPresent()) {
+            return "T2ME: invalid saved job retained: " + data.loadError().get()
+                    + "; inspect the save or explicitly discard with /t2me pregen cancel";
+        }
         if (job == null) {
             return "T2ME: no job";
         }
@@ -341,6 +382,8 @@ public final class PregenService {
         }
         ServerLevel level = resolveLevel(job.dimension());
         if (level == null) {
+            completions.close();
+            job.requeueAllInFlight();
             job.fail("dimension unloaded: " + job.dimension());
             persist();
             return;
@@ -364,12 +407,13 @@ public final class PregenService {
         ServerChunkCache chunks = level.getChunkSource();
         TicketKey ticket = new TicketKey(jobId, UUID.randomUUID(), packed);
 
-        chunks.addRegionTicket(PREGEN_TICKET, position, TICKET_DISTANCE, ticket);
         job.markInFlight(packed, nowNanos, ticket.ticketId());
 
         final CompletableFuture<Either<ChunkAccess, ChunkHolder.ChunkLoadingFailure>> future;
         MinecraftServer boundServer = server;
+        CompletionMailbox<FinishedRequest> mailbox = completions;
         try {
+            chunks.addRegionTicket(PREGEN_TICKET, position, TICKET_DISTANCE, ticket);
             ThreadPoolExecutor executor = requestExecutor;
             if (executor == null || executor.isShutdown()) {
                 throw new RejectedExecutionException("request coordinator is stopped");
@@ -384,7 +428,7 @@ public final class PregenService {
              */
             future = CompletableFuture
                     .supplyAsync(() -> {
-                        if (server != boundServer) {
+                        if (server != boundServer || !mailbox.isOpen()) {
                             throw new CompletionException(
                                     new IllegalStateException("server detached")
                             );
@@ -412,16 +456,35 @@ public final class PregenService {
         }
 
         String dimension = job.dimension();
-        future.whenComplete((result, error) -> boundServer.execute(
-                () -> completeOnServerThread(ticket, dimension, result, error)
-        ));
+        future.whenComplete((result, error) -> mailbox.offer(new FinishedRequest(
+                ticket, dimension,
+                error == null && result != null && result.left().isPresent(),
+                error != null ? rootMessage(error)
+                        : result != null && result.right().isPresent()
+                        ? result.right().get().toString() : "unknown chunk loading failure"
+        )));
+    }
+
+    private void drainCompletions() {
+        boolean changed = false;
+        FinishedRequest finished;
+        // There can be at most one completion per admitted request. No worker
+        // touches a level, ticket, job, or SavedData, even during shutdown.
+        while ((finished = completions.poll()) != null) {
+            completeOnServerThread(finished.ticket(), finished.dimension(),
+                    finished.successful(), finished.failure());
+            changed = true;
+        }
+        if (changed) {
+            persist();
+        }
     }
 
     private void completeOnServerThread(
             TicketKey ticket,
             String dimension,
-            Either<ChunkAccess, ChunkHolder.ChunkLoadingFailure> result,
-            Throwable error
+            boolean successful,
+            String failure
     ) {
         long packed = ticket.packed();
         ServerLevel level = resolveLevel(dimension);
@@ -441,14 +504,6 @@ public final class PregenService {
             return;
         }
 
-        boolean successful = error == null && result != null && result.left().isPresent();
-        String failure = "unknown chunk loading failure";
-        if (error != null) {
-            failure = rootMessage(error);
-        } else if (result != null && result.right().isPresent()) {
-            failure = result.right().get().toString();
-        }
-
         PregenJob.Completion completion = job.complete(
                 packed,
                 ticket.ticketId(),
@@ -461,9 +516,6 @@ public final class PregenService {
             T2ME.LOGGER.error("{}", job.message());
         } else if (job.state() == JobState.COMPLETED) {
             T2ME.LOGGER.info("Completed {}", statusLine());
-        }
-        if (completion != PregenJob.Completion.IGNORED) {
-            persist();
         }
     }
 
@@ -501,7 +553,7 @@ public final class PregenService {
     }
 
     private void persist() {
-        if (data == null) {
+        if (data == null || data.loadError().isPresent()) {
             return;
         }
         if (job == null) {
@@ -509,6 +561,11 @@ public final class PregenService {
         } else {
             data.snapshot(job.snapshot());
         }
+    }
+
+    /** Immutable operational snapshot for integrations and server tests. */
+    public java.util.Optional<PregenJob.Snapshot> snapshot() {
+        return job == null ? java.util.Optional.empty() : java.util.Optional.of(job.snapshot());
     }
 
     private static String rootMessage(Throwable throwable) {
@@ -540,7 +597,7 @@ public final class PregenService {
                 1,
                 0L,
                 TimeUnit.MILLISECONDS,
-                new ArrayBlockingQueue<>(32),
+                new ArrayBlockingQueue<>(AdaptiveLimiter.MAX_PIPELINE_SIZE),
                 runnable -> {
                     Thread thread = new Thread(runnable, "T2ME-Request-Coordinator");
                     thread.setDaemon(true);
@@ -565,5 +622,8 @@ public final class PregenService {
     }
 
     private record TicketKey(UUID jobId, UUID ticketId, long packed) {
+    }
+
+    private record FinishedRequest(TicketKey ticket, String dimension, boolean successful, String failure) {
     }
 }

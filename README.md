@@ -29,15 +29,18 @@ responsiveness**.
 - Center-out pregeneration in `circle` or `square` regions.
 - Spawn-centered jobs or explicit dimension and block coordinates.
 - A bounded pipeline of vanilla/Forge `FULL` chunk futures.
-- Adaptive admission using tick-time EWMA, heap headroom, processor count, and
-  online-player load.
-- Persistent cursor, progress, failures, and pending coordinates.
+- Adaptive admission that ramps up on healthy ticks and backs off on tick-time
+  or heap pressure, with additional protection while players are online.
+- Constant-time square planning and circle planning proportional to chunk rows,
+  with allocation-free sequential traversal.
+- Persistent cursor, progress, failures, retry attempts, and pending coordinates.
 - Safe clean-restart recovery with an optional 10-second auto-resume delay.
 - Pause, resume, cancel, status, metrics, CPS, and ETA commands.
 - Per-request region tickets with cleanup on success, failure, cancellation,
   and normal shutdown.
 - Stalled-request detection and bounded retries without silently skipping the
   affected coordinate.
+- Validated checkpoints that retain unreadable job data for operator inspection.
 - A compatibility guard for known pregenerators and invasive threading mods.
 - Server-only installation; unmodified clients can connect.
 
@@ -127,16 +130,18 @@ resource-location syntax, for example:
 
 ## Configuration
 
-The defaults are intentionally conservative. Measure MSPT, heap, and player
-experience before increasing concurrency.
+Admission starts at four requests and gradually grows toward the configured
+ceiling while the server is healthy. Measure MSPT, heap, and player experience
+before increasing that ceiling. Existing server configuration files keep their
+saved values when upgrading.
 
 | Key | Default | Range | Effect |
 | --- | ---: | ---: | --- |
-| `scheduler.maxInFlight` | `8` | `1–32` | Maximum simultaneous `FULL` requests before adaptive caps. |
-| `scheduler.maxDispatchPerTick` | `4` | `1–16` | Maximum new requests admitted at the end of one tick. |
-| `scheduler.targetTickMillis` | `45` | `20–100` | Halve admission when tick EWMA reaches this value. |
-| `scheduler.hardStopTickMillis` | `55` | `30–200` | Stop new admission while tick EWMA is at or above this value. |
-| `scheduler.minHeapHeadroomMiB` | `1024` | `256–8192` | Stop new admission below this max-heap headroom. |
+| `scheduler.maxInFlight` | `32` | `1–256` | Ceiling for the adaptive number of simultaneous `FULL` requests. |
+| `scheduler.maxDispatchPerTick` | `16` | `1–256` | Maximum new requests admitted at the end of one tick. |
+| `scheduler.targetTickMillis` | `45` | `20–100` | Reduce admission when the latest tick or tick EWMA reaches this value. |
+| `scheduler.hardStopTickMillis` | `55` | `30–200` | Stop new admission immediately on a latest-tick or EWMA breach; wait for sustained recovery. |
+| `scheduler.minHeapHeadroomMiB` | `1024` | `256–8192` | Heap reserve, capped at 25% of maximum heap so small heaps remain usable. |
 | `scheduler.stallTimeoutSeconds` | `120` | `30–3600` | Pause the job when the oldest request exceeds this age. |
 | `scheduler.reduceWhenPlayersOnline` | `true` | boolean | Halve admission while one or more players are online. |
 | `job.maxRetries` | `2` | `0–10` | Retry count per failed coordinate before pausing the job. |
@@ -146,8 +151,11 @@ experience before increasing concurrency.
 | `job.allowCompetingPregenerators` | `false` | boolean | Override the compatibility guard. Use only when the other mod is inactive. |
 | `permissionLevel` | `4` | `0–4` | Required permission level for `/t2me`. |
 
-The effective in-flight limit is also capped at twice the JVM's available
-processors, with a minimum processor cap of two and an absolute cap of 32.
+The limit counts outstanding futures, rather than worker threads; it is no
+longer capped by processor count. Minecraft controls the worker pool. The
+absolute request ceiling is 256, and a hard tick-time stop requires 20 healthy
+ticks before admission resumes. See [adaptive admission](docs/ARCHITECTURE.md#adaptive-admission)
+for the thresholds and recovery behavior.
 
 ## Safety and compatibility
 
@@ -164,6 +172,9 @@ T2ME makes the following guarantees within its own code:
   late callback from completing a newer job's request.
 - A failed coordinate is retried or retained when the job pauses; it is not
   silently counted as complete.
+- Retry attempts survive a restart. Invalid checkpoint contents are retained,
+  and starting a new job is blocked until the operator explicitly discards them
+  with `/t2me pregen cancel` after inspection.
 
 T2ME blocks `start` and `resume` by default when it detects Chunky, C2ME,
 C2ME Forge, Chunk Pregenerator, Dimensional Threading, or MCMT. Canary and
@@ -186,6 +197,14 @@ hardware, JVM, and server-health target.
 See the [feature-by-feature comparison](docs/COMPARISON.md) for the practical
 differences and guidance on choosing a setup.
 
+The [reproducible planner benchmark](benchmarks/README.md) compares planning
+overhead with T2ME's original algorithm. It checks matching counts and ordered
+sequence hashes. World-generation throughput still requires a controlled server
+benchmark; a faster planner alone cannot establish a winner against Chunky.
+Use the [server comparison harness](docs/BENCHMARKING.md) to measure matching
+regions on copies of a prepared world and verify that every target chunk is
+saved at `FULL` status.
+
 ## Limitations
 
 - Forge 1.20.1 only.
@@ -196,9 +215,8 @@ differences and guidance on choosing a setup.
   optimization patches.
 - Previously generated chunks are still requested at `FULL`; they normally
   complete quickly but count toward progress.
-- Planning counts the region synchronously when a job starts. The
-  20,000-block radius cap limits this work, but very large plans can still
-  pause the command thread briefly.
+- Planning runs on the command thread, using at most 2,501 chunk rows for a
+  circle and constant-time counting for a square at the 20,000-block radius cap.
 - Recovery depends on normal Forge world saving. Keep external world backups;
   no mod can protect data from every crash, disk, hardware, or third-party
   failure.
@@ -223,9 +241,20 @@ cd T2ME
 
 The reobfuscated production JAR is written to `build/libs/`.
 
-The unit suite covers deterministic spiral traversal, shape boundaries,
-cursor restoration, coordinate limits, stale ticket identities, retry
-exhaustion, and restart requeue ordering.
+The unit suite covers deterministic spiral traversal, exact shape boundaries,
+cursor restoration, checkpoint validation, coordinate limits, admission
+recovery, completion handoff, stale ticket identities, retry exhaustion, and
+restart requeue ordering.
+
+Run the Forge integration test server separately:
+
+```powershell
+.\gradlew.bat runGameTestServer
+```
+
+On Linux/macOS, use `./gradlew runGameTestServer`. This exercises real chunk
+generation, pause/resume, saved checkpoint reload, cancellation, and world
+saving. The GameTest sources and fixtures are separate from the production JAR.
 
 ## Project status
 

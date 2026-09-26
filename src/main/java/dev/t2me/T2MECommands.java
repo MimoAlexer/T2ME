@@ -14,9 +14,8 @@ import net.minecraft.world.level.Level;
 public final class T2MECommands {
     private static final int MIN_RADIUS_BLOCKS = 16;
     /*
-     * SpiralChunkPlan counts accepted chunks synchronously when a job is
-     * created. Keep the operator command bounded so an accidental extra zero
-     * cannot monopolize the server thread. This still supports a 20 km radius.
+     * Bound operator mistakes and the size of the persisted job. Plan creation
+     * uses at most 2,501 rows at this 20 km radius, without scanning the area.
      */
     private static final int MAX_RADIUS_BLOCKS = SpiralChunkPlan.MAX_RADIUS_BLOCKS;
 
