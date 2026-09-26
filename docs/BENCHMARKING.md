@@ -10,6 +10,9 @@ JVM, storage, and machine**. It does not establish a universally fastest mod.
 The planner benchmark in `benchmarks/` measures a different thing: traversal
 CPU overhead, without a Minecraft server.
 
+See the [2026-09-26 validation record](VALIDATION.md) for the measured artifacts,
+all paired results, and the limits of that comparison.
+
 ## Prepare the inputs
 
 1. Install Forge 47.4.21 in a dedicated benchmark template directory. Start it

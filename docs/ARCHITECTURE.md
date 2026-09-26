@@ -152,11 +152,14 @@ Consequently, boundary chunks are included even when only part of the chunk
 lies inside the requested shape. This is deliberate: it avoids gaps at the
 edge.
 
-The shared geometry counts square targets in constant time. Circle geometry calculates an
-inclusive X interval for each chunk row using the nearest block Z and an exact
-integer square root. Construction and storage are proportional to the row
-count, with at most 2,501 rows under the 20,000-block radius limit. Membership
-checks then use those intervals in constant time.
+The legacy spiral geometry counts square targets in constant time. Circle
+geometry calculates an inclusive X interval for each chunk row using the
+nearest block Z and an exact integer square root. This geometry's construction
+and storage are proportional to the row count, with at most 2,501 rows under
+the 20,000-block radius limit. Membership checks use those intervals in
+constant time. The region plan also enumerates intersecting regions and builds
+the arrays described below; its complete construction is not constant-time
+for squares.
 
 The region plan stores accepted counts for each intersecting region and prefix
 totals, without enumerating every target chunk. At the radius limit its primitive

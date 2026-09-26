@@ -11,8 +11,9 @@ All notable changes to T2ME are documented here. The project follows
 
 - Schedule new jobs by region with Hilbert traversal inside each region for
   better locality. Persist traversal order and preserve legacy spiral cursors.
-- Count square plans in constant time and circle plans by chunk row instead of
-  scanning the entire area. Preserve the original traversal and saved cursors.
+- Count legacy spiral square plans in constant time and circle plans by chunk
+  row instead of scanning the entire area. Region plans additionally build
+  per-region counts and prefix totals without enumerating every target chunk.
 - Traverse with cached lookahead and incremental coordinates, removing repeated
   square roots and coordinate allocations from the sequential path.
 - Adapt the in-flight window gradually up to the configured limit. Defaults are
@@ -55,6 +56,8 @@ All notable changes to T2ME are documented here. The project follows
   world-generation speed relative to Chunky.
 - Reject server errors during comparison startup, generation, saving, and
   shutdown, even when a subsequent flush produces all requested FULL chunks.
+- Record the tested artifact, all paired server timings, and real process
+  restart checks in [the validation report](docs/VALIDATION.md).
 
 ## [0.1.0] - 2026-07-25
 

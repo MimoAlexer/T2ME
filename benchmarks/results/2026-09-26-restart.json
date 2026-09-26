@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "date": "2026-09-26",
+  "source_revision": "91851818605999144cca83a8968f2ba5be9321b7",
+  "procedure": "Orderly stop during a running 4225-chunk region-order job; launch a new server process, verify same job, automatic resume, completion and FULL chunks after save-all flush.",
+  "auto_resume_observed": true,
+  "both_shutdowns_clean": true,
+  "restored_pending_coordinates": 54,
+  "result": {
+    "success": true,
+    "jar_sha256": "21e20f0b6c622e490bf8eda96ead3cf4c520ef6cf04f28ea2a9f1dc0736fabd5",
+    "interrupted_status": [
+      "dd300fc3-a52a-42e8-a1fc-4fffc2b559b7",
+      "running",
+      116,
+      4225
+    ],
+    "restored_status": [
+      "dd300fc3-a52a-42e8-a1fc-4fffc2b559b7",
+      "paused",
+      166,
+      4225
+    ],
+    "verified_full_chunks": 4225,
+    "completed_status": [
+      "dd300fc3-a52a-42e8-a1fc-4fffc2b559b7",
+      "completed",
+      4225,
+      4225
+    ]
+  },
+  "console_logs": {
+    "before": {
+      "path": "run-benchmark/production-restart-region/before/console.log",
+      "sha256": "6ae97a6ce7f650cde3a588e4a1629d793a32954f08299384ba51def7ff773366",
+      "server_errors": []
+    },
+    "after": {
+      "path": "run-benchmark/production-restart-region/after/console.log",
+      "sha256": "2724f7c39bc6620420fb8b01468bd26f77cc58a130bb5842ad86d41d631e90c7",
+      "server_errors": []
+    }
+  },
+  "scope": "Normal process stop/start only; not a power-loss or arbitrary modpack recovery test."
+}

@@ -65,7 +65,9 @@ T2ME has no required third-party mod dependency.
 1. Back up the world and test the backup before pregenerating a large region.
 2. Stop the server.
 3. Download the T2ME JAR from
-   [GitHub Releases](https://github.com/MimoAlexer/T2ME/releases).
+   [GitHub Releases](https://github.com/MimoAlexer/T2ME/releases). For an
+   unreleased branch, use its successful CI run's checksummed JAR artifact or
+   build that branch using the instructions below.
 4. Place it in the server's `mods` directory.
 5. Remove or disable other active pregenerators, then start the server.
 
@@ -210,6 +212,8 @@ establish a winner against Chunky.
 Use the [server comparison harness](docs/BENCHMARKING.md) to measure matching
 regions on copies of a prepared world and verify that every target chunk is
 saved at `FULL` status.
+The [validation record](docs/VALIDATION.md) identifies the tested JAR, environment,
+complete comparison results, and restart checks.
 
 ## Limitations
 

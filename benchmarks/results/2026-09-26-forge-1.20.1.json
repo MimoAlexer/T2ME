@@ -1,0 +1,225 @@
+{
+  "schema": 1,
+  "date": "2026-09-26",
+  "source_revision": "91851818605999144cca83a8968f2ba5be9321b7",
+  "raw_report": "run-benchmark/region-refill-default/report.json",
+  "raw_report_sha256": "b6baf80921dfb7d7550f1da07315eecca9358ef4bcffcf342589c6c89eb6de6f",
+  "benchmark_harness_sha256": "fe9f00ffb01591b72e70c64124236c6b13113b242d31961b01b97a18216cedf7",
+  "created_epoch_seconds": 1790424870.828699,
+  "comparable": true,
+  "artifacts": {
+    "t2me": {
+      "name": "T2ME",
+      "version": "0.2.0",
+      "file": "t2me-refill-candidate.jar",
+      "sha256": "21e20f0b6c622e490bf8eda96ead3cf4c520ef6cf04f28ea2a9f1dc0736fabd5"
+    },
+    "chunky": {
+      "name": "Chunky",
+      "version": "1.3.146",
+      "file": "Chunky-1.3.146.jar",
+      "sha256": "996a3c9b53e6c0e0850fb9e78d3546d2c37a1b789ddaf529b17e4fe62ab23141"
+    }
+  },
+  "environment": {
+    "hardware_source": "docs/VALIDATION.md",
+    "hardware_context_provenance": "Operator-recorded hardware, Java, version and player context; not report-native measurements.",
+    "report_native_fields": [
+      "logical_processors",
+      "command",
+      "python",
+      "platform"
+    ],
+    "os": "Windows 11",
+    "architecture": "amd64",
+    "cpu": "Intel Core i7-14700HX",
+    "physical_cores": 20,
+    "logical_processors": 28,
+    "physical_ram_bytes": 34053414912,
+    "storage": "Samsung MZAL81T0HFLB-00BL2, 1 TB NVMe",
+    "java_distribution": "Eclipse Temurin",
+    "java_version": "17.0.19",
+    "command": [
+      "java",
+      "-Xms2G",
+      "-Xmx4G",
+      "@libraries/net/minecraftforge/forge/1.20.1-47.4.21/win_args.txt",
+      "nogui"
+    ],
+    "minecraft_version": "1.20.1",
+    "forge_version": "47.4.21",
+    "python": "3.12.10 (tags/v3.12.10:0cc8128, Apr  8 2025, 12:21:36) [MSC v.1943 64 bit (AMD64)]",
+    "platform": "win32",
+    "players": 0
+  },
+  "selection": {
+    "dimension": "minecraft:overworld",
+    "shape": "square",
+    "center_x": 8192,
+    "center_z": 8192,
+    "radius": 512,
+    "expected_chunks": 4225,
+    "chunk_x_inclusive": [
+      480,
+      544
+    ],
+    "chunk_z_inclusive": [
+      480,
+      544
+    ]
+  },
+  "world_level_dat_sha256": "fbceb3bca1677e2a084207b95d8456c11c28a4045447c427548a3ffed2d193de",
+  "configuration": {
+    "server_properties": {
+      "level-seed": "234567890",
+      "level-type": "minecraft:normal",
+      "generate-structures": "true",
+      "difficulty": "easy",
+      "gamemode": "survival",
+      "view-distance": "5",
+      "simulation-distance": "5",
+      "sync-chunk-writes": "true",
+      "max-tick-time": "60000"
+    },
+    "t2me": {
+      "traversal": "region",
+      "local_traversal": "Hilbert",
+      "completion_refill": "coalesced server-queue tasks",
+      "server_config": {
+        "permissionLevel": 4,
+        "scheduler": {
+          "maxInFlight": 64,
+          "maxDispatchPerTick": 32,
+          "targetTickMillis": 45,
+          "hardStopTickMillis": 55,
+          "minHeapHeadroomMiB": 1024,
+          "stallTimeoutSeconds": 120,
+          "reduceWhenPlayersOnline": true
+        },
+        "job": {
+          "maxRetries": 2,
+          "saveIntervalTicks": 100,
+          "progressLogIntervalSeconds": 60,
+          "autoResume": true,
+          "allowCompetingPregenerators": false
+        }
+      }
+    },
+    "chunky": {
+      "traversal": "region",
+      "working_permits": 50,
+      "working_permits_source": "Chunky 1.3.146 implementation default",
+      "config": {
+        "version": 2,
+        "language": "en",
+        "continueOnRestart": false,
+        "forceLoadExistingChunks": false,
+        "silent": false,
+        "updateInterval": 1
+      }
+    }
+  },
+  "method": {
+    "paired_order": [
+      [
+        "t2me",
+        "chunky"
+      ],
+      [
+        "chunky",
+        "t2me"
+      ]
+    ],
+    "fresh_world_copy_per_run": true,
+    "one_candidate_installed_per_run": true,
+    "completion_seconds": "Start-command send to observed completion acknowledgement.",
+    "completion_and_flush_seconds": "Same start through the subsequent save-all flush acknowledgement.",
+    "preferred_metric": "completion_and_flush_seconds",
+    "full_coverage_checked_before_shutdown": true,
+    "clean_shutdown_required": true,
+    "complete_console_error_audit_required": true,
+    "filesystem_caches_cleared": false,
+    "precision": "Raw report numeric values retained without rounding."
+  },
+  "runs": [
+    {
+      "candidate": "t2me",
+      "pair": 1,
+      "success": true,
+      "reported_chunks": 4225,
+      "completion_seconds": 61.55959789996268,
+      "completion_and_flush_seconds": 62.23130839999067,
+      "verified_full_chunks": 4225,
+      "clean_shutdown": true,
+      "completion_cps": 68.63267701757619,
+      "completion_and_flush_cps": 67.8918716097673,
+      "server_errors": [],
+      "evidence_directory": "run-benchmark/region-refill-default/01-t2me"
+    },
+    {
+      "candidate": "chunky",
+      "pair": 1,
+      "success": true,
+      "reported_chunks": 4225,
+      "completion_seconds": 62.90280320000602,
+      "completion_and_flush_seconds": 63.388334599963855,
+      "verified_full_chunks": 4225,
+      "clean_shutdown": true,
+      "completion_cps": 67.16711791946969,
+      "completion_and_flush_cps": 66.65264242487937,
+      "server_errors": [],
+      "evidence_directory": "run-benchmark/region-refill-default/02-chunky"
+    },
+    {
+      "candidate": "chunky",
+      "pair": 2,
+      "success": true,
+      "reported_chunks": 4225,
+      "completion_seconds": 61.78116269997554,
+      "completion_and_flush_seconds": 62.110749099985696,
+      "verified_full_chunks": 4225,
+      "clean_shutdown": true,
+      "completion_cps": 68.38654074086683,
+      "completion_and_flush_cps": 68.02365228599332,
+      "server_errors": [],
+      "evidence_directory": "run-benchmark/region-refill-default/03-chunky"
+    },
+    {
+      "candidate": "t2me",
+      "pair": 2,
+      "success": true,
+      "reported_chunks": 4225,
+      "completion_seconds": 62.217980100016575,
+      "completion_and_flush_seconds": 62.974295900028665,
+      "verified_full_chunks": 4225,
+      "clean_shutdown": true,
+      "completion_cps": 67.90641536752291,
+      "completion_and_flush_cps": 67.0908652429741,
+      "server_errors": [],
+      "evidence_directory": "run-benchmark/region-refill-default/04-t2me"
+    }
+  ],
+  "medians": {
+    "t2me": {
+      "completion_seconds": 61.88878899998963,
+      "completion_and_flush_seconds": 62.602802150009666
+    },
+    "chunky": {
+      "completion_seconds": 62.34198294999078,
+      "completion_and_flush_seconds": 62.749541849974776
+    }
+  },
+  "chunky_time_divided_by_t2me_time": {
+    "completion_seconds": 1.0073227147812058,
+    "completion_and_flush_seconds": 1.0023439797409306
+  },
+  "limitations": [
+    "One prepared vanilla seed (234567890), one selected overworld area, and two paired repeats.",
+    "No players were connected; this is not a player-latency comparison.",
+    "Comparable mean/p95/p99 MSPT and player latency were not measured.",
+    "Filesystem caches were not cleared between runs; alternating order does not eliminate all cache effects.",
+    "Results apply to these artifacts, settings, hardware and storage; they do not establish universal fastest performance.",
+    "Timing uses console-observed completion/flush acknowledgements and includes command/output observation overhead.",
+    "Raw worlds, server installations and logs are retained locally rather than included in the repository."
+  ]
+}
