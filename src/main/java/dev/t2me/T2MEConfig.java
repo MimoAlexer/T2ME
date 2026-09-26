@@ -28,19 +28,32 @@ public final class T2MEConfig {
         ).push("scheduler");
 
         MAX_IN_FLIGHT = builder
-                .comment("Maximum simultaneous FULL chunk requests. Hard-capped at 32.")
-                .defineInRange("maxInFlight", 8, 1, 32);
+                .comment(
+                        "Maximum simultaneous FULL chunk requests. Hard-capped at 256.",
+                        "Admission starts at four and grows while tick time and heap are healthy.",
+                        "Futures use Minecraft's worker pool; this is not a thread count."
+                )
+                .defineInRange("maxInFlight", 64, 1, AdaptiveLimiter.MAX_PIPELINE_SIZE);
         MAX_DISPATCH_PER_TICK = builder
-                .comment("Maximum new requests issued at the end of one server tick.")
-                .defineInRange("maxDispatchPerTick", 4, 1, 16);
+                .comment("Maximum new requests shared by tick-end dispatch and queued refills in one tick.")
+                .defineInRange("maxDispatchPerTick", 32, 1, AdaptiveLimiter.MAX_PIPELINE_SIZE);
         TARGET_TICK_MILLIS = builder
-                .comment("Admission is reduced when the tick EWMA exceeds this value.")
+                .comment(
+                        "Admission is reduced when the latest tick or tick EWMA reaches this value.",
+                        "Keep below hardStopTickMillis; reversed thresholds use hardStopTickMillis minus one."
+                )
                 .defineInRange("targetTickMillis", 45, 20, 100);
         HARD_STOP_TICK_MILLIS = builder
-                .comment("Admission stops entirely above this tick EWMA.")
+                .comment(
+                        "Admission stops immediately when the latest tick or tick EWMA reaches this value.",
+                        "Recovery requires 20 ticks with both measurements below 90% of the target."
+                )
                 .defineInRange("hardStopTickMillis", 55, 30, 200);
         MIN_HEAP_HEADROOM_MIB = builder
-                .comment("Stop admission when max heap headroom falls below this many MiB.")
+                .comment(
+                        "Stop admission below this heap reserve, capped at 25% of the JVM maximum heap.",
+                        "Admission resumes only after additional headroom is available to avoid oscillation."
+                )
                 .defineInRange("minHeapHeadroomMiB", 1024, 256, 8192);
         STALL_TIMEOUT_SECONDS = builder
                 .comment("Pause admission if the oldest in-flight request exceeds this age.")

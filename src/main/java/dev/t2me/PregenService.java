@@ -5,6 +5,7 @@ import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.TickTask;
 import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
@@ -36,6 +37,7 @@ public final class PregenService {
     private static final int TICKET_DISTANCE = 0;
 
     private final AdaptiveLimiter limiter = new AdaptiveLimiter();
+    private final TickDispatchBudget dispatchBudget = new TickDispatchBudget();
 
     private volatile MinecraftServer server;
     private ThreadPoolExecutor requestExecutor;
@@ -45,14 +47,22 @@ public final class PregenService {
     private AdaptiveLimiter.Decision lastDecision =
             new AdaptiveLimiter.Decision(0, "not started", 0L);
     private long tickStartedNanos;
+    private long previousEndWorkNanos;
+    private long outsideQueuedWorkNanos;
+    private boolean insideTick;
+    private boolean servicing;
+    private volatile int serverTaskTick;
     private long tickCounter;
     private long autoResumeAtTick = Long.MAX_VALUE;
     private long lastProgressLogTick;
+    private CompletionMailbox<FinishedRequest> completions = new CompletionMailbox<>();
 
     private PregenService() {
     }
 
     public void attach(MinecraftServer server) {
+        completions.close();
+        completions = new CompletionMailbox<>();
         if (requestExecutor != null) {
             requestExecutor.shutdownNow();
         }
@@ -60,6 +70,15 @@ public final class PregenService {
         this.server = server;
         this.job = null;
         this.tickCounter = 0L;
+        this.tickStartedNanos = 0L;
+        this.previousEndWorkNanos = 0L;
+        this.outsideQueuedWorkNanos = 0L;
+        this.insideTick = false;
+        this.serverTaskTick = server.getTickCount();
+        this.dispatchBudget.reset();
+        this.lastProgressLogTick = 0L;
+        this.limiter.reset();
+        this.lastDecision = new AdaptiveLimiter.Decision(0, "warming up", 0L);
         this.autoResumeAtTick = Long.MAX_VALUE;
         this.compatibility = CompatibilityGuard.inspect();
         this.data = server.overworld().getDataStorage().computeIfAbsent(
@@ -97,6 +116,18 @@ public final class PregenService {
         if (server == null) {
             return;
         }
+        servicing = true;
+        try {
+            detachOnServerThread();
+        } finally {
+            servicing = false;
+            insideTick = false;
+        }
+    }
+
+    private void detachOnServerThread() {
+        drainCompletions();
+        completions.close();
         if (job != null && !job.state().isTerminal()) {
             releaseAllTickets(job);
             job.requeueAllInFlight();
@@ -116,47 +147,54 @@ public final class PregenService {
 
     public void tickStart() {
         tickStartedNanos = System.nanoTime();
+        insideTick = true;
+        dispatchBudget.reset();
+        if (server != null) {
+            serverTaskTick = server.getTickCount();
+        }
     }
 
     public void tickEnd() {
         if (server == null) {
+            insideTick = false;
             return;
         }
+        servicing = true;
+        try {
+            tickEndOnServerThread();
+        } finally {
+            servicing = false;
+            insideTick = false;
+        }
+    }
 
+    private void tickEndOnServerThread() {
         long now = System.nanoTime();
+        drainCompletions();
+        long decisionStarted = System.nanoTime();
         if (tickStartedNanos != 0L) {
-            limiter.recordTick(now - tickStartedNanos);
+            // Include completion handling now and the previous tick's admission,
+            // snapshot and logging cost. Otherwise T2ME hides its own work from
+            // backpressure by measuring only the tick before this listener.
+            limiter.recordTick(decisionStarted - tickStartedNanos
+                    + previousEndWorkNanos + outsideQueuedWorkNanos);
+            outsideQueuedWorkNanos = 0L;
         }
         tickCounter++;
-        lastDecision = limiter.decide(server);
+        lastDecision = limiter.decide(server, job != null && job.state() == JobState.RUNNING);
 
         if (job != null
                 && tickCounter >= autoResumeAtTick
                 && job.state() == JobState.PAUSED) {
             autoResumeAtTick = Long.MAX_VALUE;
+            compatibility = CompatibilityGuard.inspect();
             if (!compatibility.blocksStart() && job.resume()) {
                 T2ME.LOGGER.info("Auto-resumed T2ME job {}", job.id());
                 persist();
             }
         }
 
-        if (job != null && job.state() == JobState.RUNNING) {
-            long stallAge = job.oldestInFlightAgeNanos(now);
-            long stallLimit = T2MEConfig.STALL_TIMEOUT_SECONDS.get() * 1_000_000_000L;
-            if (stallAge >= stallLimit && job.inFlightCount() > 0) {
-                long packed = job.oldestInFlightPacked();
-                job.pause(
-                        "stalled for " + (stallAge / 1_000_000_000L)
-                                + "s at chunk "
-                                + SpiralChunkPlan.unpackX(packed) + ","
-                                + SpiralChunkPlan.unpackZ(packed)
-                );
-                T2ME.LOGGER.error("{}", job.message());
-                persist();
-            } else {
-                dispatch(now);
-            }
-        }
+        dispatchRunningJob(now);
 
         int saveInterval = T2MEConfig.SAVE_INTERVAL_TICKS.get();
         if (job != null && tickCounter % saveInterval == 0L) {
@@ -171,6 +209,7 @@ public final class PregenService {
             lastProgressLogTick = tickCounter;
             T2ME.LOGGER.info("{}", statusLine());
         }
+        previousEndWorkNanos = System.nanoTime() - decisionStarted;
     }
 
     public OperationResult start(
@@ -182,6 +221,10 @@ public final class PregenService {
     ) {
         if (server == null) {
             return OperationResult.failure("T2ME is not attached to a server");
+        }
+        if (data.loadError().isPresent()) {
+            return OperationResult.failure("saved job is invalid: " + data.loadError().get()
+                    + ". Inspect the save, then use /t2me pregen cancel to discard it explicitly.");
         }
         compatibility = CompatibilityGuard.inspect();
         if (compatibility.blocksStart()) {
@@ -212,6 +255,9 @@ public final class PregenService {
             return OperationResult.failure("could not create plan: " + rootMessage(error));
         }
         autoResumeAtTick = Long.MAX_VALUE;
+        completions.close();
+        completions = new CompletionMailbox<>();
+        limiter.resetAdmission();
         lastProgressLogTick = tickCounter;
         persist();
         T2ME.LOGGER.info(
@@ -228,8 +274,13 @@ public final class PregenService {
     }
 
     public OperationResult pause() {
+        autoResumeAtTick = Long.MAX_VALUE;
         if (job == null) {
             return OperationResult.failure("no T2ME job exists");
+        }
+        if (job.state() == JobState.PAUSED) {
+            persist();
+            return OperationResult.success(statusLine());
         }
         if (job.state() != JobState.RUNNING) {
             return OperationResult.failure("job is " + job.state().name().toLowerCase(Locale.ROOT));
@@ -240,6 +291,7 @@ public final class PregenService {
     }
 
     public OperationResult resume() {
+        autoResumeAtTick = Long.MAX_VALUE;
         if (job == null) {
             return OperationResult.failure("no T2ME job exists");
         }
@@ -255,12 +307,18 @@ public final class PregenService {
     }
 
     public OperationResult cancel() {
+        autoResumeAtTick = Long.MAX_VALUE;
+        if (data != null && data.loadError().isPresent()) {
+            data.clear();
+            return OperationResult.success("invalid saved job discarded; a new job can now be started");
+        }
         if (job == null) {
             return OperationResult.failure("no T2ME job exists");
         }
         if (job.state().isTerminal()) {
             return OperationResult.failure("job is already " + job.state().name().toLowerCase(Locale.ROOT));
         }
+        completions.close();
         releaseAllTickets(job);
         job.cancel();
         persist();
@@ -268,6 +326,10 @@ public final class PregenService {
     }
 
     public String statusLine() {
+        if (data != null && data.loadError().isPresent()) {
+            return "T2ME: invalid saved job retained: " + data.loadError().get()
+                    + "; inspect the save or explicitly discard with /t2me pregen cancel";
+        }
         if (job == null) {
             return "T2ME: no job";
         }
@@ -284,7 +346,7 @@ public final class PregenService {
 
         return String.format(
                 Locale.ROOT,
-                "T2ME job=%s state=%s dim=%s center=%d,%d radius=%d shape=%s "
+                "T2ME job=%s state=%s dim=%s center=%d,%d radius=%d shape=%s order=%s "
                         + "done=%d/%d (%.2f%%) inFlight=%d retryQueue=%d failures=%d "
                         + "cps5=%.2f cps60=%.2f eta=%s throttle=%s message=%s",
                 job.id(),
@@ -294,6 +356,7 @@ public final class PregenService {
                 job.centerBlockZ(),
                 job.radiusBlocks(),
                 job.shape().serializedName(),
+                job.order().serializedName(),
                 job.completed(),
                 job.target(),
                 percent,
@@ -310,15 +373,21 @@ public final class PregenService {
 
     public String metricsLine() {
         double headroomGiB = lastDecision.heapHeadroomBytes() / (1024.0D * 1024.0D * 1024.0D);
+        AdaptiveLimiter.Telemetry telemetry = limiter.telemetry();
         return String.format(
                 Locale.ROOT,
                 "T2ME metrics: tickEWMA=%.2fms tickPeak=%.2fms admission=%d "
-                        + "heapHeadroom=%.2fGiB players=%d | %s",
+                        + "heapHeadroom=%.2fGiB players=%d activeTicks=%d "
+                        + "msptBlockedTicks=%d heapBlockedTicks=%d softBackoffs=%d | %s",
                 limiter.tickEwmaMillis(),
                 limiter.tickPeakMillis(),
                 lastDecision.maxInFlight(),
                 headroomGiB,
                 server == null ? 0 : server.getPlayerCount(),
+                telemetry.activeTicks(),
+                telemetry.tickStoppedTicks(),
+                telemetry.heapStoppedTicks(),
+                telemetry.softBackoffs(),
                 statusLine()
         );
     }
@@ -341,19 +410,40 @@ public final class PregenService {
         }
         ServerLevel level = resolveLevel(job.dimension());
         if (level == null) {
+            completions.close();
+            job.requeueAllInFlight();
             job.fail("dimension unloaded: " + job.dimension());
             persist();
             return;
         }
 
         int capacity = Math.max(0, lastDecision.maxInFlight() - job.inFlightCount());
-        int dispatchCount = Math.min(capacity, T2MEConfig.MAX_DISPATCH_PER_TICK.get());
-        for (int issued = 0; issued < dispatchCount && job.hasDispatchableWork(); issued++) {
+        int perTickLimit = T2MEConfig.MAX_DISPATCH_PER_TICK.get();
+        for (int issued = 0; issued < capacity && job.hasDispatchableWork()
+                && dispatchBudget.tryAcquire(perTickLimit); issued++) {
             long packed = job.pollNext();
             issue(level, job.id(), packed, nowNanos);
             if (job.state() != JobState.RUNNING) {
                 break;
             }
+        }
+    }
+
+    private void dispatchRunningJob(long nowNanos) {
+        if (job == null || job.state() != JobState.RUNNING) {
+            return;
+        }
+        long stallAge = job.oldestInFlightAgeNanos(nowNanos);
+        long stallLimit = T2MEConfig.STALL_TIMEOUT_SECONDS.get() * 1_000_000_000L;
+        if (stallAge >= stallLimit && job.inFlightCount() > 0) {
+            long packed = job.oldestInFlightPacked();
+            job.pause("stalled for " + (stallAge / 1_000_000_000L)
+                    + "s at chunk " + SpiralChunkPlan.unpackX(packed)
+                    + "," + SpiralChunkPlan.unpackZ(packed));
+            T2ME.LOGGER.error("{}", job.message());
+            persist();
+        } else {
+            dispatch(nowNanos);
         }
     }
 
@@ -364,12 +454,13 @@ public final class PregenService {
         ServerChunkCache chunks = level.getChunkSource();
         TicketKey ticket = new TicketKey(jobId, UUID.randomUUID(), packed);
 
-        chunks.addRegionTicket(PREGEN_TICKET, position, TICKET_DISTANCE, ticket);
         job.markInFlight(packed, nowNanos, ticket.ticketId());
 
         final CompletableFuture<Either<ChunkAccess, ChunkHolder.ChunkLoadingFailure>> future;
         MinecraftServer boundServer = server;
+        CompletionMailbox<FinishedRequest> mailbox = completions;
         try {
+            chunks.addRegionTicket(PREGEN_TICKET, position, TICKET_DISTANCE, ticket);
             ThreadPoolExecutor executor = requestExecutor;
             if (executor == null || executor.isShutdown()) {
                 throw new RejectedExecutionException("request coordinator is stopped");
@@ -384,7 +475,7 @@ public final class PregenService {
              */
             future = CompletableFuture
                     .supplyAsync(() -> {
-                        if (server != boundServer) {
+                        if (server != boundServer || !mailbox.isOpen()) {
                             throw new CompletionException(
                                     new IllegalStateException("server detached")
                             );
@@ -412,16 +503,89 @@ public final class PregenService {
         }
 
         String dimension = job.dimension();
-        future.whenComplete((result, error) -> boundServer.execute(
-                () -> completeOnServerThread(ticket, dimension, result, error)
-        ));
+        future.whenComplete((result, error) -> {
+            boolean schedule = mailbox.offer(new FinishedRequest(
+                    ticket, dimension,
+                    error == null && result != null && result.left().isPresent(),
+                    error != null ? rootMessage(error)
+                            : result != null && result.right().isPresent()
+                            ? result.right().get().toString() : "unknown chunk loading failure"
+            ));
+            if (schedule) {
+                enqueueCompletionDrain(boundServer, jobId, mailbox);
+            }
+        });
+    }
+
+    private void enqueueCompletionDrain(
+            MinecraftServer boundServer,
+            UUID jobId,
+            CompletionMailbox<FinishedRequest> mailbox
+    ) {
+        // BlockableEventLoop.tell always enqueues and unparks, including calls
+        // from the server thread. execute/submit may run inline and recurse.
+        boundServer.tell(new TickTask(serverTaskTick,
+                () -> drainQueuedCompletions(boundServer, jobId, mailbox)));
+    }
+
+    private void drainQueuedCompletions(
+            MinecraftServer boundServer,
+            UUID jobId,
+            CompletionMailbox<FinishedRequest> mailbox
+    ) {
+        if (server != boundServer || completions != mailbox || !mailbox.isOpen()
+                || job == null || !job.id().equals(jobId)) {
+            mailbox.finishScheduledDrain(false);
+            return;
+        }
+        if (servicing) {
+            // Defensive guard for a nested vanilla task pump. Tick-end draining
+            // remains a fallback; do not self-reschedule into a busy loop.
+            mailbox.finishScheduledDrain(false);
+            return;
+        }
+        long started = System.nanoTime();
+        boolean countOutsideTick = !insideTick;
+        servicing = true;
+        try {
+            drainCompletions();
+            if (job.state() == JobState.RUNNING) {
+                // Recheck heap and player pressure without recording another
+                // tick or spending a second per-tick admission budget.
+                lastDecision = limiter.decide(boundServer, true);
+                dispatchRunningJob(System.nanoTime());
+            }
+        } finally {
+            servicing = false;
+            if (mailbox.finishScheduledDrain(true)) {
+                enqueueCompletionDrain(boundServer, jobId, mailbox);
+            }
+            if (countOutsideTick) {
+                outsideQueuedWorkNanos += System.nanoTime() - started;
+            }
+        }
+    }
+
+    private void drainCompletions() {
+        boolean changed = false;
+        FinishedRequest finished;
+        // There can be at most one completion per admitted request. No worker
+        // touches a level, ticket, job, or SavedData, even during shutdown.
+        while ((finished = completions.poll()) != null) {
+            completeOnServerThread(finished.ticket(), finished.dimension(),
+                    finished.successful(), finished.failure());
+            changed = true;
+        }
+        if (changed) {
+            persist();
+        }
     }
 
     private void completeOnServerThread(
             TicketKey ticket,
             String dimension,
-            Either<ChunkAccess, ChunkHolder.ChunkLoadingFailure> result,
-            Throwable error
+            boolean successful,
+            String failure
     ) {
         long packed = ticket.packed();
         ServerLevel level = resolveLevel(dimension);
@@ -441,14 +605,6 @@ public final class PregenService {
             return;
         }
 
-        boolean successful = error == null && result != null && result.left().isPresent();
-        String failure = "unknown chunk loading failure";
-        if (error != null) {
-            failure = rootMessage(error);
-        } else if (result != null && result.right().isPresent()) {
-            failure = result.right().get().toString();
-        }
-
         PregenJob.Completion completion = job.complete(
                 packed,
                 ticket.ticketId(),
@@ -460,10 +616,7 @@ public final class PregenService {
         if (completion == PregenJob.Completion.PAUSED) {
             T2ME.LOGGER.error("{}", job.message());
         } else if (job.state() == JobState.COMPLETED) {
-            T2ME.LOGGER.info("Completed {}", statusLine());
-        }
-        if (completion != PregenJob.Completion.IGNORED) {
-            persist();
+            T2ME.LOGGER.info("Completed {}", metricsLine());
         }
     }
 
@@ -501,7 +654,7 @@ public final class PregenService {
     }
 
     private void persist() {
-        if (data == null) {
+        if (data == null || data.loadError().isPresent()) {
             return;
         }
         if (job == null) {
@@ -509,6 +662,11 @@ public final class PregenService {
         } else {
             data.snapshot(job.snapshot());
         }
+    }
+
+    /** Immutable operational snapshot for integrations and server tests. */
+    public java.util.Optional<PregenJob.Snapshot> snapshot() {
+        return job == null ? java.util.Optional.empty() : java.util.Optional.of(job.snapshot());
     }
 
     private static String rootMessage(Throwable throwable) {
@@ -540,7 +698,7 @@ public final class PregenService {
                 1,
                 0L,
                 TimeUnit.MILLISECONDS,
-                new ArrayBlockingQueue<>(32),
+                new ArrayBlockingQueue<>(AdaptiveLimiter.MAX_PIPELINE_SIZE),
                 runnable -> {
                     Thread thread = new Thread(runnable, "T2ME-Request-Coordinator");
                     thread.setDaemon(true);
@@ -565,5 +723,8 @@ public final class PregenService {
     }
 
     private record TicketKey(UUID jobId, UUID ticketId, long packed) {
+    }
+
+    private record FinishedRequest(TicketKey ticket, String dimension, boolean successful, String failure) {
     }
 }

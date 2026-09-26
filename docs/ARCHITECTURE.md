@@ -1,6 +1,6 @@
 # T2ME architecture and safety
 
-This document describes T2ME 0.1.0 as implemented for Forge 1.20.1. It is
+This document describes T2ME 0.2.0 as implemented for Forge 1.20.1. It is
 intended for server operators, reviewers, and contributors who need the
 threading and persistence model rather than a marketing summary.
 
@@ -13,7 +13,7 @@ T2ME is designed around five constraints:
    thread on each request.
 3. Let Minecraft and Forge perform terrain generation, lighting, and storage
    through their normal task graph.
-4. Adapt admission to tick time, memory headroom, CPU availability, and player
+4. Adapt admission to tick time, memory headroom, and player
    presence.
 5. Preserve enough state to continue after a normal restart without skipping
    requests that had not completed.
@@ -29,29 +29,33 @@ pipeline, the region-file layer, or an engine optimization mod.
 | `T2MECommands` | Defines permission-gated operator commands and validates their arguments. |
 | `PregenService` | Owns the active job, tickets, request pipeline, lifecycle, metrics, and persistence boundaries. |
 | `PregenJob` | Tracks state, counters, retries, pending and in-flight coordinates, rates, and snapshots. |
-| `SpiralChunkPlan` | Deterministically enumerates chunks center-out and filters them against the requested block-space shape. |
+| `ChunkPlan` | Common traversal, cursor, shape, and checkpoint-validation contract. |
+| `RegionChunkPlan` | Groups new jobs by region and traverses each region with a Hilbert curve. |
+| `SpiralChunkPlan` | Preserves the original chunk spiral and shape geometry for legacy checkpoints. |
 | `AdaptiveLimiter` | Calculates the current request-admission limit. |
+| `CompletionMailbox` | Transfers immutable results to coalesced server tasks and discards late results after closure. |
+| `TickDispatchBudget` | Shares one admission budget between the tick listener and completion tasks. |
 | `CompatibilityGuard` | Detects known competing pregenerators and invasive threading mods. |
 | `T2MEData` | Stores one job snapshot using overworld `SavedData`. |
+| Chunk-load NBT mixin | Gives load consumers their own NBT object instead of exposing data shared with a pending disk write. |
 
 ## Request flow
 
 ```mermaid
 flowchart TD
-    A["End of server tick"] --> B["AdaptiveLimiter calculates admission"]
-    B --> C{"Capacity and work available?"}
+    A["Tick end or queued completion task"] --> O["Drain mailbox: remove tickets, count or retry, pause on exhaustion"]
+    O --> P["Persist changed state once for the batch"]
+    P --> B["AdaptiveLimiter calculates admission"]
+    B --> C{"Capacity, tick budget, and work available?"}
     C -- "No" --> A
     C -- "Yes" --> D["Plan supplies the next chunk"]
-    D --> E["Server thread adds a unique region ticket"]
-    E --> F["Server thread marks request in flight"]
+    D --> E["Server thread marks request in flight"]
+    E --> F["Server thread adds a unique region ticket"]
     F --> G["Coordinator calls public getChunkFuture"]
     G --> H["Minecraft/Forge worker graph reaches FULL"]
-    H --> I["Callback is queued on the server thread"]
-    I --> J["Server thread removes the ticket"]
-    J --> K{"Request succeeded?"}
-    K -- "Yes" --> L["Count completion and persist"]
-    K -- "No, retry remains" --> M["Requeue coordinate and persist"]
-    K -- "No retries remain" --> N["Retain coordinate and pause job"]
+    H --> I["Callback publishes an immutable completion"]
+    I --> J["Coalesce one task on the server queue"]
+    J --> A
 ```
 
 ### Why there is a coordinator thread
@@ -72,32 +76,73 @@ This coordinator is not a terrain-generation executor. It:
 
 All of those responsibilities remain with the server thread or the standard
 Minecraft/Forge task graph. The coordinator executor has one thread and a
-bounded queue of 32 submissions.
+bounded queue of 256 submissions.
 
 ## Thread ownership
 
 | Operation | Owner |
 | --- | --- |
 | Command handling and plan creation | Server thread |
-| Admission decision | Server thread, at tick end |
+| Admission decision | Server thread; fresh samples at tick end, pressure rechecked before queued refills |
 | Add/remove T2ME region tickets | Server thread |
 | Poll the plan and update job state | Server thread |
 | Call `getChunkFuture` and compose its returned future | T2ME request coordinator |
 | Terrain generation, status transitions, and lighting | Minecraft/Forge task graph |
+| Publish result and enqueue a coalesced drain | Future completion thread, through the mailbox and server queue |
 | Interpret completion and update counters | Server thread |
 | Snapshot job state | Server thread through Forge `SavedData` |
 
-The future completion callback captures a ticket identity and schedules its
-handler through `MinecraftServer#execute`. The handler ignores completion
-against a different job UUID. Tickets additionally include a unique issuance
-UUID so a cancelled or retried request cannot collide with a later request for
-the same coordinate.
+The future completion callback publishes a small immutable result and claims at
+most one scheduled drain for its mailbox. `MinecraftServer.tell(TickTask)` always
+enqueues; completion handling never runs inline in that callback. The queued
+task checks captured server, job, and mailbox identity before draining. It then
+refills available slots under the current health decision and remaining tick
+budget. Tick-end dispatch and queued refills share that budget; only tick start
+or attaching a server resets it, not starting another job.
+
+The server also drains at tick end and before detach. Each batch snapshots once.
+A synchronized handoff schedules a successor if completion arrives during the
+drain's final handoff. A reentrancy guard defers a nested pump to the tick-end
+fallback. Closing a mailbox discards queued and future results; cancellation
+and detach release tickets and retain or cancel pending work on the server
+thread. Workers never execute cleanup themselves after shutdown.
+
+The completion handler ignores a different job UUID. Tickets additionally
+include a unique issuance UUID so a cancelled or retried request cannot collide
+with a later request for the same coordinate.
+
+## Chunk-load NBT ownership
+
+Minecraft 1.20.1's `IOWorker.loadAsync` can return the exact `CompoundTag`
+held by a pending write. `ChunkStorage.upgradeChunkTag` then adds and removes
+the root `__context` key. If the I/O worker is serializing the same tag,
+iteration can fail with `ConcurrentModificationException`. A larger
+pregeneration test exposed this during chunk unloading and reloading.
+
+T2ME wraps the load result with a synchronous continuation that deep-copies
+present NBT. Each load operation can then upgrade its own tag without mutating the
+pending writer's object. Empty results and exceptional completion retain their
+normal behavior. This also covers loads unrelated to T2ME while the mod is
+installed. It adds no executor and performs no region-file I/O itself.
+
+The mixin is required: a missing target causes startup to fail rather than
+silently omitting the ownership fix. Forge integration tests verify the
+transformed runtime, and packaged-server benchmarks check the reobfuscated
+JAR. This is a narrowly scoped storage correctness fix, not a terrain
+generation algorithm change.
 
 ## Planning model
 
-`SpiralChunkPlan` enumerates a deterministic square spiral centered on the
-chunk containing the requested block coordinate. A cursor counts inspected
-candidates. This makes the traversal resumable with a single `long`.
+New jobs use `RegionChunkPlan`: regions are ordered outward from the center
+region, and chunks within each region follow a 32-by-32 Hilbert curve. Grouping
+nearby requests improves locality in Minecraft's generation graph and region
+storage. Local Hilbert coordinates are precomputed once. Neither chunk geometry
+nor terrain generation changes.
+
+Legacy jobs use `SpiralChunkPlan`, a deterministic square spiral centered on
+the chunk containing the requested block coordinate. Each plan has its own
+candidate cursor. The persisted `Order` field selects the matching plan;
+checkpoints without that field always use the legacy spiral.
 
 - `square` accepts any chunk whose block bounds overlap the requested square.
 - `circle` accepts any chunk whose block bounds intersect the requested
@@ -107,27 +152,73 @@ Consequently, boundary chunks are included even when only part of the chunk
 lies inside the requested shape. This is deliberate: it avoids gaps at the
 edge.
 
-The plan calculates its accepted target count when the job is created. Command
-input is limited to a radius of 16–20,000 blocks, and the entire region must
-remain inside `±29,999,984` block coordinates.
+The legacy spiral geometry counts square targets in constant time. Circle
+geometry calculates an inclusive X interval for each chunk row using the
+nearest block Z and an exact integer square root. This geometry's construction
+and storage are proportional to the row count, with at most 2,501 rows under
+the 20,000-block radius limit. Membership checks use those intervals in
+constant time. The region plan also enumerates intersecting regions and builds
+the arrays described below; its complete construction is not constant-time
+for squares.
+
+The region plan stores accepted counts for each intersecting region and prefix
+totals, without enumerating every target chunk. At the radius limit its primitive
+arrays need about 150 KiB plus shared Hilbert tables. Restoration combines complete
+region totals with at most one partial Hilbert region. Sequential traversal
+allocates no coordinate objects. Both planners cache lookahead without changing
+the persisted cursor, and both validate exact visited/pending checkpoint coverage.
+
+The retained spiral increments coordinates without per-candidate square roots.
+Its checkpoint coverage uses completed rings and row intervals. Existing 0.1
+and earlier spiral checkpoints therefore resume at exactly their original
+positions. Unknown or malformed orders are rejected and retained for inspection.
+
+Old binaries do not understand region cursors. Use a pre-upgrade world backup
+when downgrading; completing or cancelling a job still leaves its checkpoint
+on disk. New binaries can continue old spiral checkpoints without conversion.
+
+Command input is limited to a radius of 16–20,000 blocks, and the entire region
+must remain inside `±29,999,984` block coordinates. See the
+[standalone planner benchmark](../benchmarks/README.md) for a reproducible
+comparison with the original planner implementation.
 
 ## Adaptive admission
 
-Every server tick, T2ME records elapsed tick time and updates an exponentially
-weighted moving average with an alpha of `0.08`. The base request limit is:
+Every server tick, T2ME records the latest elapsed tick time and updates an
+exponentially weighted moving average with an alpha of `0.08`. The measurement
+includes completion handling and the previous tick's admission, snapshot and
+logging work. Queued drain/refill work between ticks is accumulated into the next
+sample; work inside a tick is already included and is not counted twice.
+Rechecking admission between samples cannot advance ramping or recovery.
+A new job starts
+with a request window of four, or its configured ceiling if lower. The default
+ceiling is 64 and the absolute ceiling is 256. This is a count of futures;
+Minecraft owns worker allocation, so processor count does not cap the window.
 
-```text
-min(configured maxInFlight, clamp(available processors × 2, 2, 32))
-```
+Admission is adjusted in this order:
 
-Admission is then adjusted in this order:
+1. Stop below the configured heap reserve, capped at 25% of maximum heap.
+   Resume only when an additional recovery margin is available. That margin is
+   the smaller of 1/16 of maximum heap and the greater of 16 MiB or 1/8 of the
+   reserve.
+2. Stop immediately when either the latest tick or EWMA reaches
+   `hardStopTickMillis`. Require 20 consecutive ticks with both measurements at
+   or below 90% of the target before resuming. Restore at most four requests,
+   never more than the pre-stop window or current configured ceiling. Any
+   intervening heap pressure forces recovery at one request.
+3. Halve the window when either tick measurement reaches `targetTickMillis`,
+   at most once every five recorded ticks. If thresholds are reversed, use
+   `hardStopTickMillis - 1` as the effective target.
+4. While a job is running and both measurements remain at or below 90% of the
+   target, grow the window every ten ticks by roughly one quarter, bounded to
+   an increase of one through eight and the configured ceiling.
+5. Halve the effective admission limit while players are online and
+   `reduceWhenPlayersOnline` is enabled, retaining a minimum of one unless a
+   hard stop is active.
 
-1. Stop when max-heap headroom is below `minHeapHeadroomMiB`.
-2. After the initial tick samples, stop when tick EWMA reaches
-   `hardStopTickMillis`.
-3. Halve the limit when tick EWMA reaches `targetTickMillis`.
-4. Halve the resulting limit again when players are online and
-   `reduceWhenPlayersOnline` is enabled.
+Idle and paused jobs do not grow the window. Repeated decision queries within
+one tick cannot advance the controller. Heap pressure resets the window to one
+and uses a separate recovery margin to avoid oscillating around the threshold.
 
 At most `maxDispatchPerTick` new requests are issued in one tick, and never
 more than the remaining effective in-flight capacity.
@@ -160,7 +251,7 @@ admission and records the chunk in the job message. It does not attempt unsafe
 future cancellation or force a chunk-state transition.
 
 Pausing stops new admission. Already-issued futures may finish, and their
-server-thread callbacks can still advance progress. Cancelling releases all
+server-thread completion handling can still advance progress. Cancelling releases all
 currently tracked T2ME tickets and clears the active job's queues.
 
 ## Persistence and restart recovery
@@ -171,9 +262,23 @@ The snapshot contains:
 - job UUID and state;
 - dimension, center, radius, and shape;
 - traversal cursor and completion/failure counts;
-- creation time and current message; and
-- pending coordinates, including requests that were in flight when a normal
-  server stop began.
+- creation time and current message;
+- traversal order (`region` for new jobs, `spiral` for legacy checkpoints);
+- pending coordinates and their retry attempts, including requests that were
+  in flight or polled for dispatch when a normal server stop began.
+
+The optional retry fields preserve the existing 0.1 snapshot layout. A valid
+older snapshot is still accepted, with unknown prior retry counts starting at
+zero. New snapshots preserve attempts across restarts; retry exhaustion pauses
+the job while retaining its coordinate for an explicit operator resume.
+
+Loading validates field types, dimensions, bounds, cursor range, counters,
+pending-coordinate uniqueness and membership, retry references, and coverage of
+all accepted candidates before the cursor. A checkpoint that would silently
+lose visited chunks is rejected. Invalid original job data is retained on disk
+and reported by `/t2me status`; starting another job is blocked. After inspecting
+or backing up that data, an operator can explicitly discard it using
+`/t2me pregen cancel`.
 
 During a normal stop, T2ME releases its region tickets, requeues all in-flight
 coordinates, preserves a `RUNNING` state, and marks the snapshot dirty. On the
@@ -183,6 +288,12 @@ next server start, a recovered `RUNNING` job is first changed to `PAUSED`. If
 
 A job that was manually paused or paused by stall/failure handling remains
 paused across restart. It does not auto-resume.
+
+Completion metrics use fixed-size time buckets rather than retaining an object
+for every completion. During startup or after resume, the rate denominator is
+the smaller of elapsed run time and the requested window, with a 100 ms floor.
+Successful requests release their retry history. Snapshot
+cost is proportional to current pending work rather than completed world area.
 
 Persistence reduces duplicate or skipped work after a clean restart; it is not
 a substitute for backups. Abrupt process termination can lose state since the
@@ -229,8 +340,8 @@ Changes should preserve all of these invariants:
 
 - One persisted job is supported at a time.
 - Only loaded dimensions can be targeted.
-- Shape planning and target counting happen synchronously when `start` is
-  executed.
+- Shape planning happens on the command thread and uses chunk-row geometry plus
+  region prefix counts, without scanning every selected chunk.
 - There is no chunk trimming, deletion, selection import/export, or
   world-border integration.
 - T2ME does not benchmark, tune, or replace third-party terrain generators.

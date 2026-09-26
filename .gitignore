@@ -4,6 +4,8 @@ build/
 out/
 run/
 run-data/
+run-gametest/
+run-benchmark/
 logs/
 crash-reports/
 
@@ -27,4 +29,6 @@ bin/
 *.log
 *.tmp
 *.bak
+__pycache__/
+*.pyc
 mcmodsrepo/

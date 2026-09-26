@@ -26,7 +26,7 @@ server.
 | World-border-oriented workflow | Manual center/radius | Richer selection workflow | No | No |
 | Active job model | One server-wide T2ME job | More mature task/selection command model | No job | No job |
 | Concurrency model | Bounded `FULL` future pipeline; actual generation stays in Minecraft/Forge | Schedules pregeneration through the server platform | Patches hot game-engine paths | Ports/reimplements Lithium-style patches for Forge |
-| Automatic tick-time backpressure | Yes, target and hard-stop EWMA thresholds | Different scheduler; no direct 1:1 T2ME setting | Not applicable to a pregen queue | Not applicable to a pregen queue |
+| Automatic tick-time backpressure | Yes, latest-tick/EWMA thresholds, ramping and recovery hysteresis | Different scheduler; no direct 1:1 T2ME setting | Not applicable to a pregen queue | Not applicable to a pregen queue |
 | Heap-headroom admission stop | Yes | Not T2ME's specific admission model | No pregen admission | No pregen admission |
 | Reduce admission while players are online | Yes | Operator workflow/rate control differs | Optimizations remain active | Optimizations remain active |
 | Per-coordinate retries with pause on exhaustion | Yes | Different internal/task failure model | Not applicable | Not applicable |
@@ -34,7 +34,7 @@ server.
 | Pause and resume | Yes | Yes | Not applicable | Not applicable |
 | Persistent progress after normal restart | Yes | Yes in supported Chunky versions/configurations | No job to persist | No job to persist |
 | CPS, ETA, in-flight, retry, MSPT, heap, and throttle metrics | Yes, in command output | Progress/rate reporting; exact metrics differ | No pregen job metrics | No pregen job metrics |
-| Low-level mixins/engine patches | No | Not its primary role | Yes | Yes |
+| Low-level mixins/engine patches | One chunk-load NBT ownership fix; no terrain algorithm replacement | Not its primary role | Yes | Yes |
 | Direct custom region-file generation in T2ME's model | No | Uses its platform-specific generation workflow | No pregen | No pregen |
 | Runs alongside T2ME by default | Not applicable | Blocked to avoid competing pregenerators | Loader/version dependent | Allowed and detected |
 | Code embedded in T2ME | T2ME clean-room code only | No | No | No |
@@ -88,6 +88,10 @@ To compare the pregenerators:
 
 Do not compare a fresh region in one tool with an already generated region in
 the other.
+
+See [Benchmarking](BENCHMARKING.md) for the reproducible server comparison
+harness, exact matching selections, persisted `FULL` verification, and the
+distinction between planner microbenchmarks and generation throughput.
 
 ## T2ME versus Chunky
 

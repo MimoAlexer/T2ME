@@ -15,12 +15,14 @@ Build and test:
 
 ```bash
 ./gradlew clean test build
+./gradlew runGameTestServer
 ```
 
 On Windows:
 
 ```powershell
 .\gradlew.bat clean test build
+.\gradlew.bat runGameTestServer
 ```
 
 The production JAR is written to `build/libs/`.
@@ -42,4 +44,9 @@ Changes must preserve these rules:
 - Add or update tests for planner and persistence behavior.
 - Explain any threading or ticket-lifecycle impact.
 - Run `clean test build` before submitting.
+- Run `runGameTestServer` for generation, ticket, and lifecycle changes. The
+  disposable development world lives in `run-gametest/`; test sources are not
+  packaged into the production mod.
+- Use the [planner benchmark](benchmarks/README.md) for planner CPU changes and
+  the [server benchmark](docs/BENCHMARKING.md) for end-to-end comparisons.
 - Do not include Minecraft, Forge, or third-party mod binaries.
