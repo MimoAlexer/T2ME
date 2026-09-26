@@ -21,8 +21,9 @@ All notable changes to T2ME are documented here. The project follows
   restarting at no more than the previous startup-sized window. Heap pressure
   restarts at one request. Scale heap reserve for small JVM heaps and retain
   player backoff.
-- Batch worker completions through a job-specific mailbox on the server thread,
-  with one snapshot per batch. Include scheduler overhead in tick health.
+- Coalesce worker completions into queued server tasks with immediate bounded
+  refills and one snapshot per batch. Share the dispatch budget across the tick
+  listener and refills, and include scheduler overhead in tick health.
 - Bound rate-tracking memory with fixed 100 ms buckets.
 - Include per-job active ticks, tick/heap admission stops, and soft backoffs in
   metrics and completion logs to explain observed throughput.

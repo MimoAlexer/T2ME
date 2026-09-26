@@ -31,6 +31,8 @@ responsiveness**.
   traversal inside each region to improve storage and generation locality.
 - Spawn-centered jobs or explicit dimension and block coordinates.
 - A bounded pipeline of vanilla/Forge `FULL` chunk futures.
+- Coalesced server-task refills keep requests moving between ticks while sharing
+  the same per-tick admission budget.
 - Adaptive admission that ramps up on healthy ticks and backs off on tick-time
   or heap pressure, with additional protection while players are online.
 - Precomputed region counts and allocation-free sequential traversal.
@@ -141,7 +143,7 @@ saved values when upgrading.
 | Key | Default | Range | Effect |
 | --- | ---: | ---: | --- |
 | `scheduler.maxInFlight` | `64` | `1–256` | Ceiling for the adaptive number of simultaneous `FULL` requests. |
-| `scheduler.maxDispatchPerTick` | `32` | `1–256` | Maximum new requests admitted at the end of one tick. |
+| `scheduler.maxDispatchPerTick` | `32` | `1–256` | Maximum new requests shared by tick-end dispatch and queued refills in one tick. |
 | `scheduler.targetTickMillis` | `45` | `20–100` | Reduce admission when the latest tick or tick EWMA reaches this value. |
 | `scheduler.hardStopTickMillis` | `55` | `30–200` | Stop new admission immediately on a latest-tick or EWMA breach; wait for sustained recovery. |
 | `scheduler.minHeapHeadroomMiB` | `1024` | `256–8192` | Heap reserve, capped at 25% of maximum heap so small heaps remain usable. |

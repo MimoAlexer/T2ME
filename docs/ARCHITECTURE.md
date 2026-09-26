@@ -33,7 +33,8 @@ pipeline, the region-file layer, or an engine optimization mod.
 | `RegionChunkPlan` | Groups new jobs by region and traverses each region with a Hilbert curve. |
 | `SpiralChunkPlan` | Preserves the original chunk spiral and shape geometry for legacy checkpoints. |
 | `AdaptiveLimiter` | Calculates the current request-admission limit. |
-| `CompletionMailbox` | Transfers immutable completion results to the server tick and discards late results after closure. |
+| `CompletionMailbox` | Transfers immutable results to coalesced server tasks and discards late results after closure. |
+| `TickDispatchBudget` | Shares one admission budget between the tick listener and completion tasks. |
 | `CompatibilityGuard` | Detects known competing pregenerators and invasive threading mods. |
 | `T2MEData` | Stores one job snapshot using overworld `SavedData`. |
 | Chunk-load NBT mixin | Gives load consumers their own NBT object instead of exposing data shared with a pending disk write. |
@@ -42,10 +43,10 @@ pipeline, the region-file layer, or an engine optimization mod.
 
 ```mermaid
 flowchart TD
-    A["End of server tick"] --> O["Drain mailbox: remove tickets, count or retry, pause on exhaustion"]
+    A["Tick end or queued completion task"] --> O["Drain mailbox: remove tickets, count or retry, pause on exhaustion"]
     O --> P["Persist changed state once for the batch"]
     P --> B["AdaptiveLimiter calculates admission"]
-    B --> C{"Capacity and work available?"}
+    B --> C{"Capacity, tick budget, and work available?"}
     C -- "No" --> A
     C -- "Yes" --> D["Plan supplies the next chunk"]
     D --> E["Server thread marks request in flight"]
@@ -53,7 +54,8 @@ flowchart TD
     F --> G["Coordinator calls public getChunkFuture"]
     G --> H["Minecraft/Forge worker graph reaches FULL"]
     H --> I["Callback publishes an immutable completion"]
-    I -- "Next tick" --> A
+    I --> J["Coalesce one task on the server queue"]
+    J --> A
 ```
 
 ### Why there is a coordinator thread
@@ -81,22 +83,29 @@ bounded queue of 256 submissions.
 | Operation | Owner |
 | --- | --- |
 | Command handling and plan creation | Server thread |
-| Admission decision | Server thread, at tick end |
+| Admission decision | Server thread; fresh samples at tick end, pressure rechecked before queued refills |
 | Add/remove T2ME region tickets | Server thread |
 | Poll the plan and update job state | Server thread |
 | Call `getChunkFuture` and compose its returned future | T2ME request coordinator |
 | Terrain generation, status transitions, and lighting | Minecraft/Forge task graph |
-| Publish immutable completion result | Future completion thread, through the mailbox |
+| Publish result and enqueue a coalesced drain | Future completion thread, through the mailbox and server queue |
 | Interpret completion and update counters | Server thread |
 | Snapshot job state | Server thread through Forge `SavedData` |
 
-The future completion callback captures a ticket identity and publishes a small
-immutable result to the current job's mailbox. The server drains the mailbox at
-tick end and before detach, then snapshots the resulting changes once for the
-whole batch. Workers never fall back to executing completion handlers directly
-when the server stops. Closing a mailbox discards its queued and future results;
-normal cancellation and detach release tickets and retain or cancel pending work
-on the server thread.
+The future completion callback publishes a small immutable result and claims at
+most one scheduled drain for its mailbox. `MinecraftServer.tell(TickTask)` always
+enqueues; completion handling never runs inline in that callback. The queued
+task checks captured server, job, and mailbox identity before draining. It then
+refills available slots under the current health decision and remaining tick
+budget. Tick-end dispatch and queued refills share that budget; only tick start
+or attaching a server resets it, not starting another job.
+
+The server also drains at tick end and before detach. Each batch snapshots once.
+A synchronized handoff schedules a successor if completion arrives during the
+drain's final handoff. A reentrancy guard defers a nested pump to the tick-end
+fallback. Closing a mailbox discards queued and future results; cancellation
+and detach release tickets and retain or cancel pending work on the server
+thread. Workers never execute cleanup themselves after shutdown.
 
 The completion handler ignores a different job UUID. Tickets additionally
 include a unique issuance UUID so a cancelled or retried request cannot collide
@@ -175,7 +184,10 @@ comparison with the original planner implementation.
 Every server tick, T2ME records the latest elapsed tick time and updates an
 exponentially weighted moving average with an alpha of `0.08`. The measurement
 includes completion handling and the previous tick's admission, snapshot and
-logging work, so scheduler overhead contributes to backpressure. A new job starts
+logging work. Queued drain/refill work between ticks is accumulated into the next
+sample; work inside a tick is already included and is not counted twice.
+Rechecking admission between samples cannot advance ramping or recovery.
+A new job starts
 with a request window of four, or its configured ceiling if lower. The default
 ceiling is 64 and the absolute ceiling is 256. This is a count of futures;
 Minecraft owns worker allocation, so processor count does not cap the window.

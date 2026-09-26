@@ -5,6 +5,7 @@ import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.TickTask;
 import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
@@ -36,6 +37,7 @@ public final class PregenService {
     private static final int TICKET_DISTANCE = 0;
 
     private final AdaptiveLimiter limiter = new AdaptiveLimiter();
+    private final TickDispatchBudget dispatchBudget = new TickDispatchBudget();
 
     private volatile MinecraftServer server;
     private ThreadPoolExecutor requestExecutor;
@@ -46,6 +48,10 @@ public final class PregenService {
             new AdaptiveLimiter.Decision(0, "not started", 0L);
     private long tickStartedNanos;
     private long previousEndWorkNanos;
+    private long outsideQueuedWorkNanos;
+    private boolean insideTick;
+    private boolean servicing;
+    private volatile int serverTaskTick;
     private long tickCounter;
     private long autoResumeAtTick = Long.MAX_VALUE;
     private long lastProgressLogTick;
@@ -66,6 +72,10 @@ public final class PregenService {
         this.tickCounter = 0L;
         this.tickStartedNanos = 0L;
         this.previousEndWorkNanos = 0L;
+        this.outsideQueuedWorkNanos = 0L;
+        this.insideTick = false;
+        this.serverTaskTick = server.getTickCount();
+        this.dispatchBudget.reset();
         this.lastProgressLogTick = 0L;
         this.limiter.reset();
         this.lastDecision = new AdaptiveLimiter.Decision(0, "warming up", 0L);
@@ -106,6 +116,16 @@ public final class PregenService {
         if (server == null) {
             return;
         }
+        servicing = true;
+        try {
+            detachOnServerThread();
+        } finally {
+            servicing = false;
+            insideTick = false;
+        }
+    }
+
+    private void detachOnServerThread() {
         drainCompletions();
         completions.close();
         if (job != null && !job.state().isTerminal()) {
@@ -127,13 +147,28 @@ public final class PregenService {
 
     public void tickStart() {
         tickStartedNanos = System.nanoTime();
+        insideTick = true;
+        dispatchBudget.reset();
+        if (server != null) {
+            serverTaskTick = server.getTickCount();
+        }
     }
 
     public void tickEnd() {
         if (server == null) {
+            insideTick = false;
             return;
         }
+        servicing = true;
+        try {
+            tickEndOnServerThread();
+        } finally {
+            servicing = false;
+            insideTick = false;
+        }
+    }
 
+    private void tickEndOnServerThread() {
         long now = System.nanoTime();
         drainCompletions();
         long decisionStarted = System.nanoTime();
@@ -141,7 +176,9 @@ public final class PregenService {
             // Include completion handling now and the previous tick's admission,
             // snapshot and logging cost. Otherwise T2ME hides its own work from
             // backpressure by measuring only the tick before this listener.
-            limiter.recordTick(decisionStarted - tickStartedNanos + previousEndWorkNanos);
+            limiter.recordTick(decisionStarted - tickStartedNanos
+                    + previousEndWorkNanos + outsideQueuedWorkNanos);
+            outsideQueuedWorkNanos = 0L;
         }
         tickCounter++;
         lastDecision = limiter.decide(server, job != null && job.state() == JobState.RUNNING);
@@ -157,23 +194,7 @@ public final class PregenService {
             }
         }
 
-        if (job != null && job.state() == JobState.RUNNING) {
-            long stallAge = job.oldestInFlightAgeNanos(now);
-            long stallLimit = T2MEConfig.STALL_TIMEOUT_SECONDS.get() * 1_000_000_000L;
-            if (stallAge >= stallLimit && job.inFlightCount() > 0) {
-                long packed = job.oldestInFlightPacked();
-                job.pause(
-                        "stalled for " + (stallAge / 1_000_000_000L)
-                                + "s at chunk "
-                                + SpiralChunkPlan.unpackX(packed) + ","
-                                + SpiralChunkPlan.unpackZ(packed)
-                );
-                T2ME.LOGGER.error("{}", job.message());
-                persist();
-            } else {
-                dispatch(now);
-            }
-        }
+        dispatchRunningJob(now);
 
         int saveInterval = T2MEConfig.SAVE_INTERVAL_TICKS.get();
         if (job != null && tickCounter % saveInterval == 0L) {
@@ -297,8 +318,8 @@ public final class PregenService {
         if (job.state().isTerminal()) {
             return OperationResult.failure("job is already " + job.state().name().toLowerCase(Locale.ROOT));
         }
-        releaseAllTickets(job);
         completions.close();
+        releaseAllTickets(job);
         job.cancel();
         persist();
         return OperationResult.success(statusLine());
@@ -397,13 +418,32 @@ public final class PregenService {
         }
 
         int capacity = Math.max(0, lastDecision.maxInFlight() - job.inFlightCount());
-        int dispatchCount = Math.min(capacity, T2MEConfig.MAX_DISPATCH_PER_TICK.get());
-        for (int issued = 0; issued < dispatchCount && job.hasDispatchableWork(); issued++) {
+        int perTickLimit = T2MEConfig.MAX_DISPATCH_PER_TICK.get();
+        for (int issued = 0; issued < capacity && job.hasDispatchableWork()
+                && dispatchBudget.tryAcquire(perTickLimit); issued++) {
             long packed = job.pollNext();
             issue(level, job.id(), packed, nowNanos);
             if (job.state() != JobState.RUNNING) {
                 break;
             }
+        }
+    }
+
+    private void dispatchRunningJob(long nowNanos) {
+        if (job == null || job.state() != JobState.RUNNING) {
+            return;
+        }
+        long stallAge = job.oldestInFlightAgeNanos(nowNanos);
+        long stallLimit = T2MEConfig.STALL_TIMEOUT_SECONDS.get() * 1_000_000_000L;
+        if (stallAge >= stallLimit && job.inFlightCount() > 0) {
+            long packed = job.oldestInFlightPacked();
+            job.pause("stalled for " + (stallAge / 1_000_000_000L)
+                    + "s at chunk " + SpiralChunkPlan.unpackX(packed)
+                    + "," + SpiralChunkPlan.unpackZ(packed));
+            T2ME.LOGGER.error("{}", job.message());
+            persist();
+        } else {
+            dispatch(nowNanos);
         }
     }
 
@@ -463,13 +503,67 @@ public final class PregenService {
         }
 
         String dimension = job.dimension();
-        future.whenComplete((result, error) -> mailbox.offer(new FinishedRequest(
-                ticket, dimension,
-                error == null && result != null && result.left().isPresent(),
-                error != null ? rootMessage(error)
-                        : result != null && result.right().isPresent()
-                        ? result.right().get().toString() : "unknown chunk loading failure"
-        )));
+        future.whenComplete((result, error) -> {
+            boolean schedule = mailbox.offer(new FinishedRequest(
+                    ticket, dimension,
+                    error == null && result != null && result.left().isPresent(),
+                    error != null ? rootMessage(error)
+                            : result != null && result.right().isPresent()
+                            ? result.right().get().toString() : "unknown chunk loading failure"
+            ));
+            if (schedule) {
+                enqueueCompletionDrain(boundServer, jobId, mailbox);
+            }
+        });
+    }
+
+    private void enqueueCompletionDrain(
+            MinecraftServer boundServer,
+            UUID jobId,
+            CompletionMailbox<FinishedRequest> mailbox
+    ) {
+        // BlockableEventLoop.tell always enqueues and unparks, including calls
+        // from the server thread. execute/submit may run inline and recurse.
+        boundServer.tell(new TickTask(serverTaskTick,
+                () -> drainQueuedCompletions(boundServer, jobId, mailbox)));
+    }
+
+    private void drainQueuedCompletions(
+            MinecraftServer boundServer,
+            UUID jobId,
+            CompletionMailbox<FinishedRequest> mailbox
+    ) {
+        if (server != boundServer || completions != mailbox || !mailbox.isOpen()
+                || job == null || !job.id().equals(jobId)) {
+            mailbox.finishScheduledDrain(false);
+            return;
+        }
+        if (servicing) {
+            // Defensive guard for a nested vanilla task pump. Tick-end draining
+            // remains a fallback; do not self-reschedule into a busy loop.
+            mailbox.finishScheduledDrain(false);
+            return;
+        }
+        long started = System.nanoTime();
+        boolean countOutsideTick = !insideTick;
+        servicing = true;
+        try {
+            drainCompletions();
+            if (job.state() == JobState.RUNNING) {
+                // Recheck heap and player pressure without recording another
+                // tick or spending a second per-tick admission budget.
+                lastDecision = limiter.decide(boundServer, true);
+                dispatchRunningJob(System.nanoTime());
+            }
+        } finally {
+            servicing = false;
+            if (mailbox.finishScheduledDrain(true)) {
+                enqueueCompletionDrain(boundServer, jobId, mailbox);
+            }
+            if (countOutsideTick) {
+                outsideQueuedWorkNanos += System.nanoTime() - started;
+            }
+        }
     }
 
     private void drainCompletions() {

@@ -35,7 +35,7 @@ public final class T2MEConfig {
                 )
                 .defineInRange("maxInFlight", 64, 1, AdaptiveLimiter.MAX_PIPELINE_SIZE);
         MAX_DISPATCH_PER_TICK = builder
-                .comment("Maximum new requests issued at the end of one server tick.")
+                .comment("Maximum new requests shared by tick-end dispatch and queued refills in one tick.")
                 .defineInRange("maxDispatchPerTick", 32, 1, AdaptiveLimiter.MAX_PIPELINE_SIZE);
         TARGET_TICK_MILLIS = builder
                 .comment(
